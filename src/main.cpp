@@ -31,7 +31,8 @@ enum State
 {
     AUTHENTICATION,
     INPUT_PRODUCTION_ORDER,
-    COUNTING
+    COUNTING,
+    LOGOUT
 };
 State currentState = AUTHENTICATION;
 
@@ -51,6 +52,7 @@ unsigned long pphStartTime = 0;
 uint8_t payload[128];
 static osjob_t sendjob;
 const unsigned TX_INTERVAL = 3;
+volatile bool loggedOut = false;
 volatile bool authenticated = false;
 volatile bool taskCodeConfirm = false;
 // Variable for notification message
@@ -180,36 +182,37 @@ void processDownlink(uint8_t *data, uint8_t length)
     Serial.println("userCode: " + String(userCode));
 
     // Processing the action
-    if (action == 1)
-    { // Authenticate user
+    switch (action)
+    {
+    case 1: // Authenticate user
+    case 4: // Authenticate as same user
         if (result)
-            authenticated = result;
+            authenticated = true;
         else
         {
             notiActive = true;
             notiPosition = 4;
-            hmi_display("SET_TXT", 1, -1, ""); // Clear user ID display
-            hmi_display("SET_TXT", 3, -1, ""); // Clear password display
-            showNotification("Dang nhap that bai!");
+            hmi_display("SET_TXT", 1, -1, ""); // Clear user ID
+            hmi_display("SET_TXT", 3, -1, ""); // Clear password
+            showNotification(action == 1 ? "Dang nhap that bai!" : "Khac user dang nhap!");
         }
-    }
-    else if (action == 2)
-    { // Authenticate production order
+        break;
+
+    case 2: // Authenticate production order
         if (result)
             taskCodeConfirm = true;
         else
         {
             notiActive = true;
             notiPosition = 1;
-            hmi_display("SET_TXT", 0, -1, ""); // Clear production order display
+            hmi_display("SET_TXT", 0, -1, ""); // Clear production order
             showNotification("Khong tim thay lenh san xuat!");
         }
-    }
-    else if (action == 3)
-    { // Count send acknowledgment
-        if (result)
-        {
-        }
+        break;
+
+    case 3: // Count acknowledgment (do nothing for now)
+        // No action needed if result == true
+        break;
     }
 }
 
@@ -513,20 +516,19 @@ bool input_credentials()
 // This function checks if the user is authenticated and updates the state accordingly
 void handleAuthentication()
 {
-    bool isAuthenticated = false;
     if (input_credentials())
-    {
+    { // Authentication successful and go to input production order state
         if (authenticated && !taskCodeConfirm)
         {
             sensorCount = 0;
             hmi_display("JUMP(7)"); // Go to production order input state
             currentState = INPUT_PRODUCTION_ORDER;
-            taskCodeConfirm = false;
-        }
+            authenticated = false;
+        } // Check production order successful
         else if (authenticated && taskCodeConfirm)
         {
-            hmi_display("JUMP(5)"); // Go to authenticate display state
-            do_send(&sendjob); // Send last data after logout
+            hmi_display("JUMP(5)"); // Go to input loggin display state
+            do_send(&sendjob);      // Send last data after logout
             currentState = AUTHENTICATION;
             authenticated = false;
             taskCodeConfirm = false;
@@ -567,41 +569,29 @@ void handleCounting()
     handle_keypad_input(nullptr, 0, navControl);
     if (navControl == KEY_SPECIAL)
     {
-        hmi_display("JUMP(1)");
+        hmi_display("JUMP(8)");
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
-        currentState = AUTHENTICATION;
+        currentState = LOGOUT;
     }
 }
 
 void do_send(osjob_t *j)
 {
-    if (LMIC.opmode & OP_TXRXPEND)
+    if (LMIC.opmode & OP_TXRXPEND || strlen((char *)payload) == 0)
     {
-        Serial.println(F("OP_TXRXPEND, not sending"));
+        Serial.println(F(LMIC.opmode & OP_TXRXPEND ? "OP_TXRXPEND, not sending" : "Payload is empty, not sending"));
         return;
     }
 
-    if (strlen((char *)payload) == 0)
-    {
-        Serial.println(F("Payload is empty, not sending"));
-        return;
-    }
+    if (currentState == COUNTING && taskCodeConfirm)
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"3\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}", taskCode, userCode, sensorCount);
+    else if (currentState == LOGOUT)
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}", taskCode, userCode, sensorCount);
 
-    if (currentState == AUTHENTICATION || currentState == INPUT_PRODUCTION_ORDER)
-    {
-        Serial.println(F("[AUTH] Send authenticate User or Production Order"));
-        LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
-    }
-    else if (currentState == COUNTING && authenticated && taskCodeConfirm)
-    {
-        memset(payload, 0, sizeof(payload));
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"%s\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"inc\":%d,\"total\":%d}", "3", taskCode, userCode, lastSendSensorCount, sensorCount);
-        Serial.println("[COUNTING] Send count data: " + String((char *)payload));
+    if (currentState != COUNTING || taskCodeConfirm)
+        Serial.println(String(currentState == COUNTING ? "[COUNTING] " : "[AUTH] ") + "Send data: " + String((char *)payload));
 
-        LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
-        // os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(60), do_send); // 300 giây = 5 phút
-    }
-
+    LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
     Serial.println("Packet queued for transmission.");
 }
 
@@ -694,6 +684,29 @@ void loop()
     case COUNTING:
         handleCounting();
         break;
+    case LOGOUT:
+    if (keypad.getKey() == 'A')
+        {
+            do_send(&sendjob); // Send data before logout
+            hmi_display("JUMP(5)");
+            authenticated = false;
+            taskCodeConfirm = false;
+            loggedOut = true;
+            currentState = AUTHENTICATION; // Go back to authentication state
+        }
+        else if (keypad.getKey() == 'C'){
+            hmi_display("JUMP(2)");
+            attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
+            currentState = COUNTING; // Go to counting state
+        }
+        break;
     }
     notification_Display();
+    // Debug: Print current state
+    volatile static State lastState;
+    if (currentState != lastState)
+    {
+        Serial.println("Current state: " + String(currentState));
+        lastState = currentState;
+    }
 }

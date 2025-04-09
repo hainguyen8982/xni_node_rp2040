@@ -1,0 +1,14 @@
+{
+    "name": "Keypad_I2C_PCF8574",
+    "version": "1.0.0",
+    "description": "Library for I2C Keypad using PCF8574",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/yourrepo/Keypad_I2C_PCF8574"
+    },
+    "dependencies": {
+        "Wire": "*"
+    },
+    "frameworks": "arduino",
+    "platforms": ["rp2040", "atmelavr", "espressif32"]
+}

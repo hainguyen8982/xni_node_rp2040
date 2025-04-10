@@ -14,10 +14,10 @@
 #include "hardware/watchdog.h" // Include watchdog for system reset
 #include <ArduinoJson.h>
 
-#define SENSOR_PIN 23
-#define USER_ID_LENGTH 6
-#define USER_PWD_LENGTH 6
-#define PROD_ORDER_LENGTH 10
+constexpr int SENSOR_PIN = 23;
+constexpr size_t USER_ID_LENGTH = 6;
+constexpr size_t USER_PWD_LENGTH = 6;
+constexpr size_t PROD_ORDER_LENGTH = 10;
 
 // Configuration for I2C Keypad
 #define I2C_ADDR 0x26
@@ -40,18 +40,21 @@ enum NavControl
 {
     NONE,
     KEY_ENTER,     // Key A
-    KEY_CANCEL,    // Key C
     KEY_BACKSPACE, // Key B
+    KEY_CANCEL,    // Key C
     KEY_SPECIAL    // Key D
 };
+NavControl navControl = NONE;
 
-volatile bool enableInterrupt = false;
-volatile unsigned long sensorCount = 0, lastSensorCount = 0, lastSendSensorCount = 0;
+// Variables for counting
+volatile unsigned long sensorCount = 0, lastSensorCount = 0;
 unsigned long pphStartTime = 0;
-
+// Variables for LMIC
 uint8_t payload[128];
 static osjob_t sendjob;
-const unsigned TX_INTERVAL = 3;
+const unsigned TX_INTERVAL = 30000; // 30 seconds
+volatile bool txComplete = true;
+// Variables for authentication
 volatile bool loggedOut = false;
 volatile bool authenticated = false;
 volatile bool taskCodeConfirm = false;
@@ -59,17 +62,16 @@ volatile bool taskCodeConfirm = false;
 uint8_t notiPosition = 0;
 volatile bool notiActive = true;
 unsigned long notiStartTime = millis();
+// Variables using storage
+char userCode[7] = {0}; // Mã nhân viên
+char UID[9];
+char taskCode[PROD_ORDER_LENGTH];
 
 extern void do_send(osjob_t *j);
 void prepareJsonData(const char *name, uint8_t *data, size_t dataLen);
 void hmi_display(const char *command, int arg1 = -1, int arg2 = -1, const char *value = nullptr);
 void showNotification(const char *message);
 void notification_Display();
-
-// Stored variables
-char userCode[7] = {0}; // Mã nhân viên
-char UID[9];
-char taskCode[PROD_ORDER_LENGTH];
 
 // OTAA keys (Little Endian)
 static u1_t DevEUI[8];
@@ -107,7 +109,7 @@ void get_boardID()
     for (byte i = 0; i < 8; i++)
     {
         Serial.print(DevEUI[i] < 0x10 ? "0" : "");
-        Serial.print(DevEUI[i], HEX);
+        Serial.print(DevEUI[7 - i], HEX);
     }
     Serial.println();
 }
@@ -185,7 +187,6 @@ void processDownlink(uint8_t *data, uint8_t length)
     switch (action)
     {
     case 1: // Authenticate user
-    case 4: // Authenticate as same user
         if (result)
             authenticated = true;
         else
@@ -194,7 +195,7 @@ void processDownlink(uint8_t *data, uint8_t length)
             notiPosition = 4;
             hmi_display("SET_TXT", 1, -1, ""); // Clear user ID
             hmi_display("SET_TXT", 3, -1, ""); // Clear password
-            showNotification(action == 1 ? "Dang nhap that bai!" : "Khac user dang nhap!");
+            showNotification("Dang nhap that bai!");
         }
         break;
 
@@ -230,8 +231,8 @@ void onEvent(ev_t ev)
         LMIC_setLinkCheckMode(0); // Tắt kiểm tra liên kết
 
         // Gửi dữ liệu ngay sau khi Join
-        LMIC_setTxData2(1, (uint8_t *)"Hello", 5, 0);
-        Serial.println("Đã gửi dữ liệu đầu tiên!");
+        // LMIC_setTxData2(1, (uint8_t *)"Hello", 5, 0);
+        // Serial.println("Đã gửi dữ liệu đầu tiên!");
         break;
     case EV_JOIN_FAILED:
         hmi_display("SET_TXT", 0, -1, "Joining failed!");
@@ -239,19 +240,13 @@ void onEvent(ev_t ev)
         LMIC_startJoining();
         break;
     case EV_TXCOMPLETE:
-        Serial.println("Dữ liệu đã gửi thành công!");
+        Serial.println("Data sent successfully!");
+        txComplete = true;
         // Debug
         Serial.println("LMIC.opmode: " + String(LMIC.opmode, HEX));
 
         if (LMIC.dataLen > 0)
-        {
-            Serial.print("Last sent payload: ");
-            for (int i = 0; i < LMIC.dataLen; i++)
-                Serial.printf("%02X ", LMIC.frame[LMIC.dataBeg + i]);
-            Serial.println();
-
             processDownlink(&LMIC.frame[LMIC.dataBeg], LMIC.dataLen);
-        }
         break;
     case EV_RXCOMPLETE:
         Serial.println("Nhận dữ liệu Downlink!");
@@ -341,7 +336,6 @@ bool handle_keypad_input(char *buffer, uint8_t bufferSize, NavControl &navContro
     {
         navControl = KEY_CANCEL;
         buffer[0] = '\0';
-        return false;
     }
     else if (key == 'D')
     {
@@ -382,8 +376,7 @@ bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, 
     payload[strlen(jsonBuffer)] = '\0'; // Null-terminate the payload
 
     // Debug: Print JSON to Serial Monitor
-    Serial.print("JSON Payload: ");
-    Serial.println((char *)payload);
+    // Serial.println("JSON Payload: " + String((char *)payload));
 
     do_send(&sendjob); // Send the payload to the server
 
@@ -420,10 +413,13 @@ void input_production_order()
                 hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
                 delay(130);
                 attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
+                sensorCount = 0;
+                taskCodeConfirm = false;
                 currentState = COUNTING; // Go to counting state
             }
             else
             {
+                hmi_display("SET_TXT", 0, -1, ""); // Clear production order
                 memset(taskCode, 0, PROD_ORDER_LENGTH);
             }
         }
@@ -435,6 +431,15 @@ void input_production_order()
             currentState = AUTHENTICATION; // Go back to authentication state
         }
     }
+}
+
+void clear_field_credentials(char *userId, size_t userIdLen, char *userPwd, size_t userPwdLen, bool &isEnteringPassword)
+{
+    hmi_display("SET_TXT", 1, -1, "");
+    hmi_display("SET_TXT", 3, -1, "");
+    memset(userId, 0, userIdLen);
+    memset(userPwd, 0, userPwdLen);
+    isEnteringPassword = false;
 }
 
 // This function handles the input of credentials (either RFID or keypad) and returns true if authentication is successful
@@ -470,7 +475,7 @@ bool input_credentials()
         }
     }
 
-    // Xử lý các phím chức năng
+    // Handle function keys
     switch (navControl)
     {
     case KEY_ENTER:
@@ -483,24 +488,19 @@ bool input_credentials()
         {
             if (authenticate(userId, userPwd, nullptr, nullptr))
             {
-                // Xác thực thành công
-                hmi_display("SET_TXT", 1, -1, "");
-                hmi_display("SET_TXT", 3, -1, "");
-                memset(userId, 0, USER_ID_LENGTH + 1);
-                memset(userPwd, 0, USER_PWD_LENGTH + 1);
-                isEnteringPassword = false;
-                return true;
+                clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
+                return true; // Authentication successful
+            }
+            else
+            {
+                clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
+                return false; // Authentication failed
             }
         }
         break;
 
     case KEY_CANCEL:
-        // Hủy xác thực
-        hmi_display("SET_TXT", 1, -1, "");
-        hmi_display("SET_TXT", 3, -1, "");
-        memset(userId, 0, USER_ID_LENGTH + 1);
-        memset(userPwd, 0, USER_PWD_LENGTH + 1);
-        isEnteringPassword = false;
+        clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
         return false;
 
     default:
@@ -517,33 +517,12 @@ bool input_credentials()
 void handleAuthentication()
 {
     if (input_credentials())
-    { // Authentication successful and go to input production order state
-        if (authenticated && !taskCodeConfirm)
+    {
+        if (authenticated)
         {
-            sensorCount = 0;
             hmi_display("JUMP(7)"); // Go to production order input state
             currentState = INPUT_PRODUCTION_ORDER;
             authenticated = false;
-        } // Check production order successful
-        else if (authenticated && taskCodeConfirm)
-        {
-            hmi_display("JUMP(5)"); // Go to input loggin display state
-            do_send(&sendjob);      // Send last data after logout
-            currentState = AUTHENTICATION;
-            authenticated = false;
-            taskCodeConfirm = false;
-        }
-    }
-
-    if (taskCodeConfirm)
-    {
-        NavControl navControl = NONE;
-        handle_keypad_input(nullptr, 0, navControl);
-        if (navControl == KEY_SPECIAL)
-        {
-            hmi_display("JUMP(2)"); // Go to counting state
-            currentState = COUNTING;
-            attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
         }
     }
 }
@@ -559,8 +538,10 @@ void handleCounting()
     }
 
     static unsigned long lastSendTime = millis();
-    if (millis() - lastSendTime >= 30000) // Send data every 30 seconds
+    if (millis() - lastSendTime >= TX_INTERVAL)
     {
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"3\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, sensorCount);
         do_send(&sendjob);
         lastSendTime = millis();
     }
@@ -570,8 +551,30 @@ void handleCounting()
     if (navControl == KEY_SPECIAL)
     {
         hmi_display("JUMP(8)");
+        delay(130);
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
+    }
+}
+
+void handleLogout()
+{
+    NavControl navControl = NONE;
+    handle_keypad_input(nullptr, 0, navControl);
+    if (navControl == KEY_ENTER && txComplete)
+    {
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, sensorCount);
+        do_send(&sendjob); // Send data before logout
+        hmi_display("JUMP(5)");
+        txComplete = false;
+        currentState = AUTHENTICATION; // Go back to authentication state
+    }
+    else if (navControl == KEY_CANCEL)
+    {
+        hmi_display("JUMP(2)");
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
+        currentState = COUNTING; // Go to counting state
     }
 }
 
@@ -583,13 +586,7 @@ void do_send(osjob_t *j)
         return;
     }
 
-    if (currentState == COUNTING && taskCodeConfirm)
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"3\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}", taskCode, userCode, sensorCount);
-    else if (currentState == LOGOUT)
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}", taskCode, userCode, sensorCount);
-
-    if (currentState != COUNTING || taskCodeConfirm)
-        Serial.println(String(currentState == COUNTING ? "[COUNTING] " : "[AUTH] ") + "Send data: " + String((char *)payload));
+    Serial.println("JSON Payload: " + String((char *)payload));
 
     LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
     Serial.println("Packet queued for transmission.");
@@ -640,9 +637,6 @@ void setup()
         LMIC_setupChannel(i, 922000000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
     }
 
-    // LMIC.channelFreq[0] = 923200000;                      // Tần số kênh 0
-    // LMIC.channelDrMap[0] = DR_RANGE_MAP(DR_SF12, DR_SF7); // Dải dữ liệu cho kênh
-
     // Ensure Class C operation is configured correctly
     // LMIC_setAdrMode(0);  // Tắt chế độ ADR nếu không cần thiết
     LMIC_setLinkCheckMode(0); // Disable link check mode
@@ -685,20 +679,7 @@ void loop()
         handleCounting();
         break;
     case LOGOUT:
-    if (keypad.getKey() == 'A')
-        {
-            do_send(&sendjob); // Send data before logout
-            hmi_display("JUMP(5)");
-            authenticated = false;
-            taskCodeConfirm = false;
-            loggedOut = true;
-            currentState = AUTHENTICATION; // Go back to authentication state
-        }
-        else if (keypad.getKey() == 'C'){
-            hmi_display("JUMP(2)");
-            attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
-            currentState = COUNTING; // Go to counting state
-        }
+        handleLogout();
         break;
     }
     notification_Display();

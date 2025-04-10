@@ -7,6 +7,7 @@
 // #define DISABLE_LMIC_DUTY_CYCLE 1
 #include <lmic.h>
 #include <hal/hal.h>
+#include "hardware/adc.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "hardware/structs/nvic.h"
@@ -15,6 +16,7 @@
 #include <ArduinoJson.h>
 
 constexpr int SENSOR_PIN = 23;
+constexpr int ADC_PIN = 26;
 constexpr size_t USER_ID_LENGTH = 6;
 constexpr size_t USER_PWD_LENGTH = 6;
 constexpr size_t PROD_ORDER_LENGTH = 10;
@@ -66,6 +68,8 @@ unsigned long notiStartTime = millis();
 char userCode[7] = {0}; // Mã nhân viên
 char UID[9];
 char taskCode[PROD_ORDER_LENGTH];
+
+volatile bool powerLost = false;
 
 extern void do_send(osjob_t *j);
 void prepareJsonData(const char *name, uint8_t *data, size_t dataLen);
@@ -214,6 +218,13 @@ void processDownlink(uint8_t *data, uint8_t length)
     case 3: // Count acknowledgment (do nothing for now)
         // No action needed if result == true
         break;
+
+    case 4:
+        if (result)
+        {
+            loggedOut = true;
+        }
+        break;
     }
 }
 
@@ -312,6 +323,11 @@ void notification_Display()
 void sensorISR()
 {
     sensorCount++;
+}
+
+void powerLossISR()
+{
+    powerLost = true;
 }
 
 // This function handles the keypad input and updates the buffer accordingly
@@ -566,15 +582,18 @@ void handleLogout()
         snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
                  taskCode, userCode, sensorCount);
         do_send(&sendjob); // Send data before logout
-        hmi_display("JUMP(5)");
-        txComplete = false;
-        currentState = AUTHENTICATION; // Go back to authentication state
     }
     else if (navControl == KEY_CANCEL)
     {
         hmi_display("JUMP(2)");
         attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
         currentState = COUNTING; // Go to counting state
+    }
+    if (loggedOut)
+    {
+        hmi_display("JUMP(5)");
+        txComplete = false;
+        currentState = AUTHENTICATION; // Go back to authentication state
     }
 }
 
@@ -590,6 +609,17 @@ void do_send(osjob_t *j)
 
     LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
     Serial.println("Packet queued for transmission.");
+}
+
+void handlePowerLossDataTransmission()
+{
+    if (powerLost)
+    {
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, sensorCount);
+        do_send(&sendjob); // Send data before power loss
+        powerLost = false;
+    }
 }
 
 void setup()
@@ -608,6 +638,9 @@ void setup()
     hmi_display("JUMP(6)");
     hmi_display("SET_TXT", 0, -1, "System starting...");
     delay(130);
+
+    pinMode(ADC_PIN, INPUT); // hoặc INPUT_PULLDOWN nếu cần
+                             //   attachInterrupt(digitalPinToInterrupt(ADC_PIN), powerLossISR, FALLING);
 
     // Init for keypad
     Wire.begin();
@@ -667,6 +700,9 @@ void setup()
 void loop()
 {
     os_runloop_once();
+    notification_Display();
+    handlePowerLossDataTransmission();
+
     switch (currentState)
     {
     case AUTHENTICATION:
@@ -682,12 +718,29 @@ void loop()
         handleLogout();
         break;
     }
-    notification_Display();
-    // Debug: Print current state
-    volatile static State lastState;
-    if (currentState != lastState)
-    {
-        Serial.println("Current state: " + String(currentState));
-        lastState = currentState;
-    }
 }
+
+/*
+ * @brief This code is a simple Arduino sketch for a system that uses a LoRaWAN module to send data to a server.
+ * It includes functionalities for user authentication, production order input, and counting.
+ * The system uses an RFID reader and a keypad for user input, and it displays information on an HMI display.
+ * The code also handles power loss scenarios and sends data accordingly.
+ *
+ * @note The code is designed to run on a Raspberry Pi Pico board and uses the MCCI LoRaWAN LMIC library for LoRa communication.
+ * It also uses the MFRC522 library for RFID reading and a custom keypad library for I2C keypad input.
+ * The code is structured into several functions to handle different tasks, including sending data, processing downlink messages, and managing the state of the system.
+ * The system is designed to be modular and can be easily extended or modified for different use cases.
+ *
+ * Wiring:
+ * - MFRC522 RFID reader: CS pin to GPIO 17, RST pin to GPIO 20, MISO pin to GPIO 16, MOSI pin to GPIO 19, SCK pin to GPIO 18
+ * - Keypad: I2C address 0x26, SDA pin to GPIO 4, SCL pin to GPIO 5
+ * - LoRa module: SPI pins to GPIO 10, 11, 12 (SCK, MOSI, MISO), CS pin to GPIO 13, RST pin to GPIO 14
+ * - HMI display: TX pin to GPIO 8, RX pin to GPIO 9
+ * - Sensor pin: GPIO 23 (interrupt pin for counting)
+ * - ADC pin: GPIO 26 (for power loss detection)
+ *
+ * @note Set the frequency for AS923 by editing the project_config file in the MCCI LoRaWAN LMIC library.
+ */
+
+/*
+ */

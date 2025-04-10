@@ -253,6 +253,8 @@ void onEvent(ev_t ev)
     case EV_TXCOMPLETE:
         Serial.println("Data sent successfully!");
         txComplete = true;
+
+        Serial.println((LMIC.txrxFlags && TXRX_ACK) ? "ACK" : "NO_ACK");
         // Debug
         Serial.println("LMIC.opmode: " + String(LMIC.opmode, HEX));
 
@@ -566,10 +568,10 @@ void handleCounting()
     handle_keypad_input(nullptr, 0, navControl);
     if (navControl == KEY_SPECIAL)
     {
-        hmi_display("JUMP(8)");
-        delay(130);
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
+        hmi_display("JUMP(8)");
+        delay(200);
     }
 }
 
@@ -593,6 +595,8 @@ void handleLogout()
     {
         hmi_display("JUMP(5)");
         txComplete = false;
+        loggedOut = false;
+        memset(taskCode, 0, sizeof(taskCode));
         currentState = AUTHENTICATION; // Go back to authentication state
     }
 }
@@ -607,7 +611,7 @@ void do_send(osjob_t *j)
 
     Serial.println("JSON Payload: " + String((char *)payload));
 
-    LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
+    LMIC_setTxData2(1, payload, strlen((char *)payload), 0);
     Serial.println("Packet queued for transmission.");
 }
 
@@ -639,8 +643,8 @@ void setup()
     hmi_display("SET_TXT", 0, -1, "System starting...");
     delay(130);
 
-    pinMode(ADC_PIN, INPUT); // hoặc INPUT_PULLDOWN nếu cần
-                             //   attachInterrupt(digitalPinToInterrupt(ADC_PIN), powerLossISR, FALLING);
+    pinMode(ADC_PIN, INPUT);
+    // attachInterrupt(digitalPinToInterrupt(ADC_PIN), powerLossISR, FALLING);
 
     // Init for keypad
     Wire.begin();

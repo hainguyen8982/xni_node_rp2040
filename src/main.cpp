@@ -122,7 +122,7 @@ void get_boardID()
 void check_busy()
 {
     unsigned long start_time = millis();
-    while (millis() - start_time < 30000)
+    while (millis() - start_time < 2000)
     {
         if (Serial2.available())
         {
@@ -224,6 +224,9 @@ void processDownlink(uint8_t *data, uint8_t length)
         {
             loggedOut = true;
         }
+        else{
+            do_send(&sendjob);
+        }
         break;
     }
 }
@@ -243,6 +246,9 @@ void onEvent(ev_t ev)
 
         // Gửi dữ liệu ngay sau khi Join
         // LMIC_setTxData2(1, (uint8_t *)"Hello", 5, 0);
+        strncpy((char *)payload, "{\"a\":\"1\",\"UID\":\"12C35D1A\"}", sizeof(payload) - 1);
+        payload[sizeof(payload) - 1] = '\0'; // Ensure null termination
+        do_send(&sendjob);
         // Serial.println("Đã gửi dữ liệu đầu tiên!");
         break;
     case EV_JOIN_FAILED:
@@ -252,11 +258,17 @@ void onEvent(ev_t ev)
         break;
     case EV_TXCOMPLETE:
         Serial.println("Data sent successfully!");
-        txComplete = true;
 
+        Serial.println(LMIC.txrxFlags);
         Serial.println((LMIC.txrxFlags && TXRX_ACK) ? "ACK" : "NO_ACK");
         // Debug
         Serial.println("LMIC.opmode: " + String(LMIC.opmode, HEX));
+
+        // if ((LMIC.txrxFlags && TXRX_ACK) && !LMIC.dataLen && currentState == LOGOUT)
+        // {
+        //     do_send(&sendjob);
+        //     Serial.println("Re-send");
+        // }
 
         if (LMIC.dataLen > 0)
             processDownlink(&LMIC.frame[LMIC.dataBeg], LMIC.dataLen);
@@ -329,7 +341,9 @@ void sensorISR()
 
 void powerLossISR()
 {
-    powerLost = true;
+    snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+             taskCode, userCode, sensorCount);
+    do_send(&sendjob); // Send data before power loss
 }
 
 // This function handles the keypad input and updates the buffer accordingly
@@ -520,9 +534,6 @@ bool input_credentials()
     case KEY_CANCEL:
         clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
         return false;
-
-    default:
-        break;
     }
 
     // Clear buffer
@@ -538,9 +549,10 @@ void handleAuthentication()
     {
         if (authenticated)
         {
+            hmi_display("JUMP(7)");
             hmi_display("JUMP(7)"); // Go to production order input state
-            currentState = INPUT_PRODUCTION_ORDER;
             authenticated = false;
+            currentState = INPUT_PRODUCTION_ORDER;
         }
     }
 }
@@ -579,7 +591,7 @@ void handleLogout()
 {
     NavControl navControl = NONE;
     handle_keypad_input(nullptr, 0, navControl);
-    if (navControl == KEY_ENTER && txComplete)
+    if (navControl == KEY_ENTER)
     {
         snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
                  taskCode, userCode, sensorCount);
@@ -588,13 +600,18 @@ void handleLogout()
     else if (navControl == KEY_CANCEL)
     {
         hmi_display("JUMP(2)");
+        delay(130);
+        hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
+        delay(130);
+        hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
+        delay(130);
         attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
         currentState = COUNTING; // Go to counting state
     }
+
     if (loggedOut)
     {
         hmi_display("JUMP(5)");
-        txComplete = false;
         loggedOut = false;
         memset(taskCode, 0, sizeof(taskCode));
         currentState = AUTHENTICATION; // Go back to authentication state
@@ -613,17 +630,6 @@ void do_send(osjob_t *j)
 
     LMIC_setTxData2(1, payload, strlen((char *)payload), 0);
     Serial.println("Packet queued for transmission.");
-}
-
-void handlePowerLossDataTransmission()
-{
-    if (powerLost)
-    {
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-                 taskCode, userCode, sensorCount);
-        do_send(&sendjob); // Send data before power loss
-        powerLost = false;
-    }
 }
 
 void setup()
@@ -673,6 +679,7 @@ void setup()
     {
         LMIC_setupChannel(i, 922000000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
     }
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
 
     // Ensure Class C operation is configured correctly
     // LMIC_setAdrMode(0);  // Tắt chế độ ADR nếu không cần thiết
@@ -705,7 +712,6 @@ void loop()
 {
     os_runloop_once();
     notification_Display();
-    handlePowerLossDataTransmission();
 
     switch (currentState)
     {
@@ -721,6 +727,16 @@ void loop()
     case LOGOUT:
         handleLogout();
         break;
+    }
+
+    static State lastState;
+    if (currentState != lastState)
+    {
+        lastState = currentState;
+        Serial.println("State: " + String(currentState));
+        Serial.println("authenticated: " + String(authenticated));
+        Serial.println("taskCodeConfirm: " + String(taskCodeConfirm));
+        Serial.println("LoggedOut: " + String(loggedOut));
     }
 }
 

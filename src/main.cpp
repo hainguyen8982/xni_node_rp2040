@@ -15,6 +15,8 @@
 #include "hardware/watchdog.h" // Include watchdog for system reset
 #include <ArduinoJson.h>
 
+// #define OSTICKS_PER_SEC 32768
+
 constexpr int SENSOR_PIN = 23;
 constexpr int ADC_PIN = 26;
 constexpr size_t USER_ID_LENGTH = 6;
@@ -51,6 +53,10 @@ NavControl navControl = NONE;
 // Variables for counting
 volatile unsigned long sensorCount = 0, lastSensorCount = 0;
 unsigned long pphStartTime = 0;
+unsigned long totalTime = 0;
+unsigned long barStartTime = 0;
+bool displayProcessBar = false;
+bool progressStarted = false;
 // Variables for LMIC
 uint8_t payload[128];
 static osjob_t sendjob;
@@ -61,7 +67,6 @@ volatile bool loggedOut = false;
 volatile bool authenticated = false;
 volatile bool taskCodeConfirm = false;
 // Variable for notification message
-uint8_t notiPosition = 0;
 volatile bool notiActive = true;
 unsigned long notiStartTime = millis();
 // Variables using storage
@@ -76,6 +81,7 @@ void prepareJsonData(const char *name, uint8_t *data, size_t dataLen);
 void hmi_display(const char *command, int arg1 = -1, int arg2 = -1, const char *value = nullptr);
 void showNotification(const char *message);
 void notification_Display();
+void processBar();
 
 // OTAA keys (Little Endian)
 static u1_t DevEUI[8];
@@ -95,6 +101,20 @@ const lmic_pinmap lmic_pins = {
     .rst = 14,
     .dio = {2, 3, LMIC_UNUSED_PIN},
 };
+
+uint32_t lmic_time_until_next_tx_ms()
+{
+    ostime_t now = os_getTime();
+    if (LMIC.txend > now)
+    {
+        ostime_t remaining = LMIC.txend - now;
+        return (uint32_t)(remaining * 1000UL / OSTICKS_PER_SEC);
+    }
+    else
+    {
+        return 0; // Đã có thể truyền tiếp
+    }
+}
 
 // Get ID board
 void get_boardID()
@@ -196,7 +216,6 @@ void processDownlink(uint8_t *data, uint8_t length)
         else
         {
             notiActive = true;
-            notiPosition = 4;
             hmi_display("SET_TXT", 1, -1, ""); // Clear user ID
             hmi_display("SET_TXT", 3, -1, ""); // Clear password
             showNotification("Dang nhap that bai!");
@@ -205,11 +224,13 @@ void processDownlink(uint8_t *data, uint8_t length)
 
     case 2: // Authenticate production order
         if (result)
+        {
             taskCodeConfirm = true;
+            displayProcessBar = false;
+        }
         else
         {
             notiActive = true;
-            notiPosition = 1;
             hmi_display("SET_TXT", 0, -1, ""); // Clear production order
             showNotification("Khong tim thay lenh san xuat!");
         }
@@ -221,12 +242,9 @@ void processDownlink(uint8_t *data, uint8_t length)
 
     case 4:
         if (result)
-        {
             loggedOut = true;
-        }
-        else{
+        else
             do_send(&sendjob);
-        }
         break;
     }
 }
@@ -318,7 +336,7 @@ void showNotification(const char *message)
 {
     if (notiActive)
     {
-        hmi_display("SET_TXT", notiPosition, -1, message);
+        hmi_display("SET_TXT", 4, -1, message);
         notiStartTime = millis();
         notiActive = false;
     }
@@ -328,7 +346,7 @@ void notification_Display()
 {
     if (!notiActive && millis() - notiStartTime >= 5000)
     {
-        hmi_display("SET_TXT", notiPosition, -1, "");
+        hmi_display("SET_TXT", 4, -1, "");
         delay(130);
         notiActive = true;
     }
@@ -407,10 +425,12 @@ bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, 
     strncpy((char *)payload, jsonBuffer, strlen(jsonBuffer));
     payload[strlen(jsonBuffer)] = '\0'; // Null-terminate the payload
 
-    // Debug: Print JSON to Serial Monitor
-    // Serial.println("JSON Payload: " + String((char *)payload));
-
     do_send(&sendjob); // Send the payload to the server
+
+    // Using for process Bar
+    displayProcessBar = true;
+    progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
+    barStartTime = millis();
 
     // Wating for the server response
     unsigned long startTime = millis();
@@ -421,6 +441,8 @@ bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, 
             return true;
         if (taskCodeConfirm && currentState == INPUT_PRODUCTION_ORDER)
             return true;
+
+        processBar();
     }
 
     return false; // Authentication failed
@@ -435,10 +457,13 @@ void input_production_order()
         hmi_display("SET_TXT", 0, -1, taskCode);
         if (navControl == KEY_ENTER)
         {
+            // displayProcessBar = true;
+            // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
+            // barStartTime = millis();
             if (authenticate(nullptr, nullptr, nullptr, taskCode))
             {
                 pphStartTime = millis();
-                hmi_display("JUMP(2)");
+                hmi_display("JUMP(1)");
                 delay(130);
                 hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
                 delay(130);
@@ -457,7 +482,7 @@ void input_production_order()
         }
         else if (navControl == KEY_CANCEL)
         {
-            hmi_display("JUMP(5)");
+            hmi_display("JUMP(2)");
             authenticated = false;
             memset(taskCode, 0, PROD_ORDER_LENGTH);
             currentState = AUTHENTICATION; // Go back to authentication state
@@ -481,8 +506,13 @@ bool input_credentials()
     char rfidUid[4] = {0};
     if (read_RFID(rfidUid))
     {
+        // displayProcessBar = true;
+        // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
+        // barStartTime = millis();
         if (authenticate(nullptr, nullptr, rfidUid, nullptr))
+        {
             return true; // RFID authentication successful
+        }
     }
 
     static bool isEnteringPassword = false;
@@ -518,6 +548,9 @@ bool input_credentials()
         }
         else
         {
+            // displayProcessBar = true;
+            // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
+            // barStartTime = millis();
             if (authenticate(userId, userPwd, nullptr, nullptr))
             {
                 clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
@@ -549,8 +582,8 @@ void handleAuthentication()
     {
         if (authenticated)
         {
-            hmi_display("JUMP(7)");
-            hmi_display("JUMP(7)"); // Go to production order input state
+            hmi_display("JUMP(4)");
+            hmi_display("JUMP(4)"); // Go to production order input state
             authenticated = false;
             currentState = INPUT_PRODUCTION_ORDER;
         }
@@ -582,7 +615,7 @@ void handleCounting()
     {
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
-        hmi_display("JUMP(8)");
+        hmi_display("JUMP(5)");
         delay(200);
     }
 }
@@ -593,13 +626,16 @@ void handleLogout()
     handle_keypad_input(nullptr, 0, navControl);
     if (navControl == KEY_ENTER)
     {
+        displayProcessBar = true;
+        progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
+        barStartTime = millis();
         snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
                  taskCode, userCode, sensorCount);
         do_send(&sendjob); // Send data before logout
     }
     else if (navControl == KEY_CANCEL)
     {
-        hmi_display("JUMP(2)");
+        hmi_display("JUMP(1)");
         delay(130);
         hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
         delay(130);
@@ -611,11 +647,12 @@ void handleLogout()
 
     if (loggedOut)
     {
-        hmi_display("JUMP(5)");
+        hmi_display("JUMP(2)");
         loggedOut = false;
         memset(taskCode, 0, sizeof(taskCode));
         currentState = AUTHENTICATION; // Go back to authentication state
     }
+    processBar();
 }
 
 void do_send(osjob_t *j)
@@ -632,6 +669,57 @@ void do_send(osjob_t *j)
     Serial.println("Packet queued for transmission.");
 }
 
+void processBar()
+{
+    static uint8_t count = 0;
+
+    if (displayProcessBar)
+    {
+        uint32_t waitMs = lmic_time_until_next_tx_ms();
+
+        // Lấy totalTime một lần duy nhất khi mới bắt đầu
+        if (!progressStarted && waitMs > 0)
+        {
+            totalTime = waitMs;
+            progressStarted = true;
+            count = 0; // Đảm bảo bắt đầu từ 0%
+        }
+
+        // Cập nhật progress mỗi 300ms
+        if (millis() - barStartTime >= 300)
+        {
+            // Tính phần trăm tiến độ dựa vào thời gian còn lại
+            if (totalTime > 0)
+            {
+                uint8_t progress = (1.0f - (float)waitMs / totalTime) * 100;
+
+                if (progress > count)
+                    count = progress;
+            }
+
+            // Gửi lệnh cập nhật HMI
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "SET_PROG(5,%d);\r\n", count);
+            Serial2.print(buffer);
+
+            Serial.print("Progress: ");
+            Serial.print(count);
+            Serial.print("% | waitMs: ");
+            Serial.println(waitMs);
+
+            barStartTime = millis();
+        }
+
+        // Nếu đã hoàn thành
+        if (count >= 100 || waitMs == 0)
+        {
+            count = 0;
+            displayProcessBar = false;
+            progressStarted = false;
+        }
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -644,8 +732,8 @@ void setup()
     Serial2.begin(115200);
     while (!Serial2)
         ;
-    hmi_display("JUMP(6)");
-    hmi_display("JUMP(6)");
+    hmi_display("JUMP(3)");
+    hmi_display("JUMP(3)");
     hmi_display("SET_TXT", 0, -1, "System starting...");
     delay(130);
 
@@ -673,21 +761,23 @@ void setup()
     os_init();
     get_boardID();
     LMIC_reset();
+    LMIC_setAdrMode(0); // Disable ADR
+    LMIC_setDrTxpow(DR_SF7, 14);
 
     // Congigure AS923 channels
-    for (int i = 0; i < 8; i++)
-    {
-        LMIC_setupChannel(i, 922000000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
-    }
+    // for (int i = 0; i < 8; i++)
+    // {
+    //     LMIC_setupChannel(i, 922000000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
+    // }
+    LMIC_setupChannel(0, 923200000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
+    LMIC_setupChannel(1, 923400000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
     LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
 
     // Ensure Class C operation is configured correctly
-    // LMIC_setAdrMode(0);  // Tắt chế độ ADR nếu không cần thiết
     LMIC_setLinkCheckMode(0); // Disable link check mode
     LMIC.dn2Dr = DR_SF9;      // Set RX2 data rate for Class C
     LMIC.rxDelay = 100;       // Set RX delay
     // LMIC.globalDutyRate = 0; // Disable duty cycle
-    LMIC_setAdrMode(0); // Disable ADR
 
     LMIC_startJoining();
 
@@ -705,7 +795,7 @@ void setup()
     }
 
     delay(2000);
-    hmi_display("JUMP(5)");
+    hmi_display("JUMP(2)");
 }
 
 void loop()
@@ -727,16 +817,6 @@ void loop()
     case LOGOUT:
         handleLogout();
         break;
-    }
-
-    static State lastState;
-    if (currentState != lastState)
-    {
-        lastState = currentState;
-        Serial.println("State: " + String(currentState));
-        Serial.println("authenticated: " + String(authenticated));
-        Serial.println("taskCodeConfirm: " + String(taskCodeConfirm));
-        Serial.println("LoggedOut: " + String(loggedOut));
     }
 }
 

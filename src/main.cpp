@@ -457,9 +457,6 @@ void input_production_order()
         hmi_display("SET_TXT", 0, -1, taskCode);
         if (navControl == KEY_ENTER)
         {
-            // displayProcessBar = true;
-            // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
-            // barStartTime = millis();
             if (authenticate(nullptr, nullptr, nullptr, taskCode))
             {
                 pphStartTime = millis();
@@ -506,13 +503,8 @@ bool input_credentials()
     char rfidUid[4] = {0};
     if (read_RFID(rfidUid))
     {
-        // displayProcessBar = true;
-        // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
-        // barStartTime = millis();
         if (authenticate(nullptr, nullptr, rfidUid, nullptr))
-        {
             return true; // RFID authentication successful
-        }
     }
 
     static bool isEnteringPassword = false;
@@ -548,19 +540,9 @@ bool input_credentials()
         }
         else
         {
-            // displayProcessBar = true;
-            // progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
-            // barStartTime = millis();
-            if (authenticate(userId, userPwd, nullptr, nullptr))
-            {
-                clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
-                return true; // Authentication successful
-            }
-            else
-            {
-                clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
-                return false; // Authentication failed
-            }
+            bool success = authenticate(userId, userPwd, nullptr, nullptr);
+            clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
+            return success;
         }
         break;
 
@@ -609,15 +591,23 @@ void handleCounting()
         lastSendTime = millis();
     }
 
-    NavControl navControl = NONE;
-    handle_keypad_input(nullptr, 0, navControl);
-    if (navControl == KEY_SPECIAL)
-    {
+    if (keypad.getKey() == 'D'){
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
         hmi_display("JUMP(5)");
-        delay(200);
+        check_busy();
     }
+
+    // NavControl navControl = NONE;
+    // handle_keypad_input(nullptr, 0, navControl);
+    // if (navControl == KEY_SPECIAL)
+    // {
+    //     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
+    //     currentState = LOGOUT;
+    //     hmi_display("JUMP(5)");
+    //     check_busy();
+    //     delay(200);
+    // }
 }
 
 void handleLogout()

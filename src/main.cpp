@@ -61,7 +61,6 @@ bool progressStarted = false;
 uint8_t payload[128];
 static osjob_t sendjob;
 const unsigned TX_INTERVAL = 30000; // 30 seconds
-volatile bool txComplete = true;
 // Variables for authentication
 volatile bool loggedOut = false;
 volatile bool authenticated = false;
@@ -77,7 +76,6 @@ char taskCode[PROD_ORDER_LENGTH];
 volatile bool powerLost = false;
 
 extern void do_send(osjob_t *j);
-void prepareJsonData(const char *name, uint8_t *data, size_t dataLen);
 void hmi_display(const char *command, int arg1 = -1, int arg2 = -1, const char *value = nullptr);
 void showNotification(const char *message);
 void notification_Display();
@@ -112,7 +110,7 @@ uint32_t lmic_time_until_next_tx_ms()
     }
     else
     {
-        return 0; // Đã có thể truyền tiếp
+        return 0;
     }
 }
 
@@ -163,9 +161,7 @@ bool read_RFID(char *rfidHexStr)
 
     // Convert binary UID to hex string
     for (byte i = 0; i < mfrc522.uid.size; i++)
-    {
         sprintf(&rfidHexStr[i * 2], "%02X", mfrc522.uid.uidByte[i]);
-    }
     rfidHexStr[mfrc522.uid.size * 2] = '\0';
 
     mfrc522.PICC_HaltA();
@@ -507,6 +503,9 @@ bool input_credentials()
             return true; // RFID authentication successful
     }
 
+    if (authenticated)
+        return true;
+
     static bool isEnteringPassword = false;
     static char userId[USER_ID_LENGTH + 1] = "";
     static char userPwd[USER_PWD_LENGTH + 1] = "";
@@ -591,23 +590,13 @@ void handleCounting()
         lastSendTime = millis();
     }
 
-    if (keypad.getKey() == 'D'){
+    if (keypad.getKey() == 'D')
+    {
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
         hmi_display("JUMP(5)");
         check_busy();
     }
-
-    // NavControl navControl = NONE;
-    // handle_keypad_input(nullptr, 0, navControl);
-    // if (navControl == KEY_SPECIAL)
-    // {
-    //     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
-    //     currentState = LOGOUT;
-    //     hmi_display("JUMP(5)");
-    //     check_busy();
-    //     delay(200);
-    // }
 }
 
 void handleLogout()
@@ -792,6 +781,7 @@ void loop()
 {
     os_runloop_once();
     notification_Display();
+    processBar();
 
     switch (currentState)
     {

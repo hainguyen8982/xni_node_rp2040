@@ -14,17 +14,17 @@
 #include "pico/stdlib.h"       // Include Pico SDK for reset functionality
 #include "hardware/watchdog.h" // Include watchdog for system reset
 #include <ArduinoJson.h>
+#include "remove_diacritics.h"
+// Using: removeDiacritics(s); Serial.println(s);
 
-// #define OSTICKS_PER_SEC 32768
-
-constexpr int SENSOR_PIN = 23;
+constexpr int SENSOR_PIN = 28;
 constexpr int ADC_PIN = 26;
 constexpr size_t USER_ID_LENGTH = 6;
 constexpr size_t USER_PWD_LENGTH = 6;
 constexpr size_t PROD_ORDER_LENGTH = 10;
 
 // Configuration for I2C Keypad
-#define I2C_ADDR 0x26
+#define I2C_ADDR 0x3E
 Keypad_I2C_PCF8574 keypad(I2C_ADDR, Wire); //	(SDA:4, SCL: 5)
 // Configuration for MFRC522
 #define MFRC522_CS_PIN 17
@@ -344,6 +344,7 @@ void notification_Display()
     {
         hmi_display("SET_TXT", 4, -1, "");
         delay(130);
+        hmi_display("SET_PROG", 5, -1, 0);
         notiActive = true;
     }
 }
@@ -439,6 +440,7 @@ bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, 
             return true;
 
         processBar();
+        notification_Display();
     }
 
     return false; // Authentication failed
@@ -457,11 +459,14 @@ void input_production_order()
             {
                 pphStartTime = millis();
                 hmi_display("JUMP(1)");
-                delay(130);
+                // delay(180);
+                check_busy();
                 hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
-                delay(130);
+                // delay(180);
+                check_busy();
                 hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
-                delay(130);
+                // delay(180);
+                check_busy();
                 attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
                 sensorCount = 0;
                 taskCodeConfirm = false;
@@ -615,11 +620,14 @@ void handleLogout()
     else if (navControl == KEY_CANCEL)
     {
         hmi_display("JUMP(1)");
-        delay(130);
+        // delay(130);
+        check_busy();
         hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
-        delay(130);
+        // delay(130);
+        check_busy();
         hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
-        delay(130);
+        // delay(130);
+        check_busy();
         attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
         currentState = COUNTING; // Go to counting state
     }
@@ -702,8 +710,9 @@ void processBar()
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial)
-        ;
+    delay(2000);
+    // while (!Serial)
+    //     ;
 
     // Init for hmi display
     gpio_set_function(8, GPIO_FUNC_UART); // TX(8) --> TX Display
@@ -716,6 +725,8 @@ void setup()
     hmi_display("SET_TXT", 0, -1, "System starting...");
     delay(130);
 
+    pinMode(SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
     pinMode(ADC_PIN, INPUT);
     // attachInterrupt(digitalPinToInterrupt(ADC_PIN), powerLossISR, FALLING);
 
@@ -775,12 +786,13 @@ void setup()
 
     delay(2000);
     hmi_display("JUMP(2)");
+    detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
 }
 
 void loop()
 {
     os_runloop_once();
-    notification_Display();
+    // notification_Display();
     processBar();
 
     switch (currentState)

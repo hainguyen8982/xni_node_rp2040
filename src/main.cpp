@@ -18,10 +18,16 @@
 // Using: removeDiacritics(s); Serial.println(s);
 
 constexpr int SENSOR_PIN = 28;
-constexpr int ADC_PIN = 26;
+
+constexpr int BUZZER_PIN = 27;
 constexpr size_t USER_ID_LENGTH = 6;
 constexpr size_t USER_PWD_LENGTH = 6;
 constexpr size_t PROD_ORDER_LENGTH = 10;
+
+// Configuration for power detection
+constexpr int POWER_DETECT_PIN = 26;
+volatile bool powerLost = false;
+volatile bool powerRestored = false;
 
 // Configuration for I2C Keypad
 #define I2C_ADDR 0x3E
@@ -72,8 +78,6 @@ unsigned long notiStartTime = millis();
 char userCode[7] = {0}; // Mã nhân viên
 char UID[9];
 char taskCode[PROD_ORDER_LENGTH];
-
-volatile bool powerLost = false;
 
 extern void do_send(osjob_t *j);
 void hmi_display(const char *command, int arg1 = -1, int arg2 = -1, const char *value = nullptr);
@@ -153,6 +157,28 @@ void check_busy()
     }
 }
 
+void beep(int frequency = 2000, int duration = 100)
+{
+    tone(BUZZER_PIN, frequency); // Turn on the buzzer at the specified frequency
+    sleep_ms(duration);          // Wait for the specified duration
+    noTone(BUZZER_PIN);          // Turn off the buzzer
+}
+
+void errorBeep()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        beep(2000, 100); // Beep for 100ms
+        sleep_ms(100);   // Wait for 100ms between beeps
+    }
+}
+
+void successBeep()
+{
+    beep(2000, 500); // Beep for 500ms
+}
+
+
 // Read RFID card
 bool read_RFID(char *rfidHexStr)
 {
@@ -165,6 +191,8 @@ bool read_RFID(char *rfidHexStr)
     rfidHexStr[mfrc522.uid.size * 2] = '\0';
 
     mfrc522.PICC_HaltA();
+
+    beep(2000, 100); // Beep for 100ms
 
     return true;
 }
@@ -333,6 +361,7 @@ void showNotification(const char *message)
     if (notiActive)
     {
         hmi_display("SET_TXT", 4, -1, message);
+        errorBeep();
         notiStartTime = millis();
         notiActive = false;
     }
@@ -345,6 +374,7 @@ void notification_Display()
         hmi_display("SET_TXT", 4, -1, "");
         delay(130);
         hmi_display("SET_PROG", 5, -1, 0);
+        successBeep();
         notiActive = true;
     }
 }
@@ -354,12 +384,26 @@ void sensorISR()
     sensorCount++;
 }
 
-void powerLossISR()
-{
-    snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-             taskCode, userCode, sensorCount);
-    do_send(&sendjob); // Send data before power loss
+void powerISR(){
+    if (digitalRead(POWER_DETECT_PIN) == HIGH)
+        powerRestored = true;
+    else
+        powerLost = true;
 }
+
+void handlePowerEvent() {
+    if (powerLost) {
+      powerLost = false;
+      snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+               taskCode, userCode, sensorCount);
+      do_send(&sendjob);
+    }
+    if (powerRestored) {
+      powerRestored = false;
+      rp2040.reboot();
+    }
+  }
+  
 
 // This function handles the keypad input and updates the buffer accordingly
 // It also manages the navigation control based on the key pressed
@@ -397,6 +441,8 @@ bool handle_keypad_input(char *buffer, uint8_t bufferSize, NavControl &navContro
             buffer[strlen(buffer) + 1] = '\0';
         }
     }
+
+    beep(2000, 100); // Beep for 100ms
 
     return true;
 }
@@ -471,6 +517,7 @@ void input_production_order()
                 sensorCount = 0;
                 taskCodeConfirm = false;
                 currentState = COUNTING; // Go to counting state
+                successBeep();
             }
             else
             {
@@ -582,8 +629,12 @@ void handleCounting()
     {
         lastSensorCount = sensorCount;
         hmi_display("SET_TXT", 2, -1, String(sensorCount).c_str());
-        long pph = (sensorCount * 3600) / ((millis() - pphStartTime) / 1000); // Calculate PPH
-        hmi_display("SET_TXT", 4, -1, ("PPH: " + String(pph)).c_str());
+
+        unsigned long duration = millis() - pphStartTime;
+        if (sensorCount >= 10 && duration >= 10000){
+            long pph = (sensorCount * 3600) / (duration / 1000);
+            hmi_display("SET_TXT", 4, -1, ("PPH: " + String(pph)).c_str());
+        }
     }
 
     static unsigned long lastSendTime = millis();
@@ -599,6 +650,7 @@ void handleCounting()
     {
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
         currentState = LOGOUT;
+        beep(2000, 100); // Beep for 100ms
         hmi_display("JUMP(5)");
         check_busy();
     }
@@ -695,6 +747,8 @@ void processBar()
             Serial.println(waitMs);
 
             barStartTime = millis();
+            if (count <= 0)
+                successBeep();
         }
 
         // Nếu đã hoàn thành
@@ -727,8 +781,8 @@ void setup()
 
     pinMode(SENSOR_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
-    pinMode(ADC_PIN, INPUT);
-    // attachInterrupt(digitalPinToInterrupt(ADC_PIN), powerLossISR, FALLING);
+    pinMode(POWER_DETECT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(POWER_DETECT_PIN), powerISR, CHANGE); // Trigger on power loss
 
     // Init for keypad
     Wire.begin();
@@ -787,6 +841,7 @@ void setup()
     delay(2000);
     hmi_display("JUMP(2)");
     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
+    successBeep();
 }
 
 void loop()
@@ -794,6 +849,7 @@ void loop()
     os_runloop_once();
     // notification_Display();
     processBar();
+    handlePowerEvent();
 
     switch (currentState)
     {

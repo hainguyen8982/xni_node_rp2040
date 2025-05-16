@@ -1,48 +1,66 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <Wire.h>
-#include <MFRC522.h>
-#include "keypad_I2C_PCF8574.h"
-#include <hardware/gpio.h>
-// #define DISABLE_LMIC_DUTY_CYCLE 1
 #include <lmic.h>
 #include <hal/hal.h>
-#include "hardware/adc.h"
-#include "hardware/flash.h"
-#include "hardware/sync.h"
-#include "hardware/structs/nvic.h"
-#include "pico/stdlib.h"       // Include Pico SDK for reset functionality
-#include "hardware/watchdog.h" // Include watchdog for system reset
+#include "debug.h"
+#include "pico/unique_id.h" // Include unique ID library for Raspberry Pi Pico
 #include <ArduinoJson.h>
-#include "remove_diacritics.h"
-// Using: removeDiacritics(s); Serial.println(s);
+#include <MFRC522.h>
+#include "keypad_I2C_PCF8574.h"
+#include "HMIQueueManager.h"
 
-constexpr int SENSOR_PIN = 28;
+HMIQueueManager hmi(Serial2);
 
-constexpr int BUZZER_PIN = 27;
-constexpr size_t USER_ID_LENGTH = 6;
-constexpr size_t USER_PWD_LENGTH = 6;
-constexpr size_t PROD_ORDER_LENGTH = 10;
+// Configuration for MFRC522 RFID reader
+#define RST_PIN 20
+#define SS_PIN 17
+MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// Configuration for power detection
+// Configuration for keypad
+#define I2C_ADDR 0x3E
+Keypad_I2C_PCF8574 keypad(I2C_ADDR, Wire);
+
+constexpr int USER_ID_LENGTH = 6;
+constexpr int USER_PWD_LENGTH = 6;
+constexpr int TASK_CODE_LENGTH = 10;
+
+// Variables for power detection
 constexpr int POWER_DETECT_PIN = 26;
 volatile bool powerLost = false;
 volatile bool powerRestored = false;
 
-// Configuration for I2C Keypad
-#define I2C_ADDR 0x3E
-Keypad_I2C_PCF8574 keypad(I2C_ADDR, Wire); //	(SDA:4, SCL: 5)
-// Configuration for MFRC522
-#define MFRC522_CS_PIN 17
-#define MFRC522_RST_PIN 20
-MFRC522 mfrc522(MFRC522_CS_PIN, MFRC522_RST_PIN);
+// Variables for counting
+constexpr int SENSOR_PIN = 28;
+uint32_t countingStartTime = 0;
+uint16_t lastProductCount = 0;
+volatile uint16_t productCount = 0;
+
+// Varialble for notification
+bool enableNotify = false;
+constexpr int BUZZER_PIN = 27;
+
+// Variables for process bar
+bool activeProcessBar = false;
+bool processStarted = false;
+
+// Variables using storage
+char userCode[USER_ID_LENGTH + 1] = {0};
+char taskCode[TASK_CODE_LENGTH + 1] = {0};
+char nameProduction[32] = {0};
+
+// Varialble for authentication
+bool loggedOut = false;
+bool authenticated = false;
+bool taskCodeConfirmed = false;
+volatile bool responseReceived = false;
 
 enum State
 {
     AUTHENTICATION,
     INPUT_PRODUCTION_ORDER,
     COUNTING,
-    LOGOUT
+    LOGOUT,
+    DIAGNOSTIC_TEST
 };
 State currentState = AUTHENTICATION;
 
@@ -56,36 +74,7 @@ enum NavControl
 };
 NavControl navControl = NONE;
 
-// Variables for counting
-volatile unsigned long sensorCount = 0, lastSensorCount = 0;
-unsigned long pphStartTime = 0;
-unsigned long totalTime = 0;
-unsigned long barStartTime = 0;
-bool displayProcessBar = false;
-bool progressStarted = false;
-// Variables for LMIC
-uint8_t payload[128];
-static osjob_t sendjob;
-const unsigned TX_INTERVAL = 30000; // 30 seconds
-// Variables for authentication
-volatile bool loggedOut = false;
-volatile bool authenticated = false;
-volatile bool taskCodeConfirm = false;
-// Variable for notification message
-volatile bool notiActive = true;
-unsigned long notiStartTime = millis();
-// Variables using storage
-char userCode[7] = {0}; // Mã nhân viên
-char UID[9];
-char taskCode[PROD_ORDER_LENGTH];
-
-extern void do_send(osjob_t *j);
-void hmi_display(const char *command, int arg1 = -1, int arg2 = -1, const char *value = nullptr);
-void showNotification(const char *message);
-void notification_Display();
-void processBar();
-
-// OTAA keys (Little Endian)
+// LoRaWAN configuration
 static u1_t DevEUI[8];
 static u1_t AppEUI[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static u1_t AppKey[16] = {
@@ -104,6 +93,11 @@ const lmic_pinmap lmic_pins = {
     .dio = {2, 3, LMIC_UNUSED_PIN},
 };
 
+// Variables for LMIC
+uint8_t payload[128];
+static osjob_t sendjob;
+const unsigned TX_INTERVAL = 30000; // 30 seconds
+
 uint32_t lmic_time_until_next_tx_ms()
 {
     ostime_t now = os_getTime();
@@ -118,157 +112,192 @@ uint32_t lmic_time_until_next_tx_ms()
     }
 }
 
-// Get ID board
-void get_boardID()
+void getDevEUIFromRP2040()
 {
-    uint8_t id[8];
-    uint32_t interrupts = save_and_disable_interrupts();
-    flash_get_unique_id(id);
-    restore_interrupts(interrupts);
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
 
-    // Copy id to DevEUI
-    for (byte i = 0; i < 8; i++)
-        DevEUI[i] = id[7 - i];
-
-    // Print DevEUI
-    Serial.print("DevEUI: ");
-    for (byte i = 0; i < 8; i++)
+    DEBUG_PRINT("DevEUI: ");
+    for (int i = 0; i < 8; i++)
     {
-        Serial.print(DevEUI[i] < 0x10 ? "0" : "");
-        Serial.print(DevEUI[7 - i], HEX);
+        DevEUI[i] = board_id.id[7 - i];
+        DEBUG_PRINT(DevEUI[i] < 0x10 ? "0" : "");
+        DEBUG_PRINT(DevEUI[i], HEX);
     }
-    Serial.println();
+    DEBUG_PRINTLN();
 }
 
-// This function waits for a maximum of 1 second for the display to respond with "OK"
-void check_busy()
+void notify(const char *message = nullptr)
 {
-    unsigned long start_time = millis();
-    while (millis() - start_time < 2000)
+    static uint32_t errorTimeout = 0;
+
+    if (enableNotify)
     {
-        if (Serial2.available())
-        {
-            String response = Serial2.readString();
-            Serial.println(response);
-            Serial.println(millis() - start_time);
-            if (response.indexOf("OK") != -1)
-                return;
-        }
+        hmi.display("SET_TXT", 4, -1, message);
+        errorTimeout = millis() + 5000;
+        enableNotify = false;
+    }
+
+    if (errorTimeout > 0 && millis() > errorTimeout)
+    {
+        hmi.display("SET_TXT", 1, -1, "");
+        hmi.display("SET_TXT", 3, -1, "");
+        hmi.display("SET_TXT", 4, -1, "");
+        errorTimeout = 0;
     }
 }
 
 void beep(int frequency = 2000, int duration = 100)
 {
-    tone(BUZZER_PIN, frequency); // Turn on the buzzer at the specified frequency
-    sleep_ms(duration);          // Wait for the specified duration
-    noTone(BUZZER_PIN);          // Turn off the buzzer
+    tone(BUZZER_PIN, frequency);
+    sleep_ms(duration);
+    noTone(BUZZER_PIN);
 }
 
 void errorBeep()
 {
     for (int i = 0; i < 3; i++)
     {
-        beep(2000, 100); // Beep for 100ms
-        sleep_ms(100);   // Wait for 100ms between beeps
+        beep(2000, 300);
+        sleep_ms(100);
     }
 }
 
 void successBeep()
 {
-    beep(2000, 500); // Beep for 500ms
+    beep(2000, 500);
 }
 
-
-// Read RFID card
-bool read_RFID(char *rfidHexStr)
+void processBar()
 {
-    if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
-        return false;
+    static uint8_t count = 0;
+    static uint32_t totalTime = 0;
+    static uint32_t barStartTime = 0;
 
-    // Convert binary UID to hex string
-    for (byte i = 0; i < mfrc522.uid.size; i++)
-        sprintf(&rfidHexStr[i * 2], "%02X", mfrc522.uid.uidByte[i]);
-    rfidHexStr[mfrc522.uid.size * 2] = '\0';
+    if (activeProcessBar)
+    {
+        uint32_t waitMs = lmic_time_until_next_tx_ms();
+        // Get totalTime only once at the beginning
+        if (!processStarted && waitMs > 0)
+        {
+            processStarted = true;
+            totalTime = waitMs;
+            barStartTime = millis();
+            count = 0;
+        }
+        // Update progress every 300ms
+        if (millis() - barStartTime >= 300)
+        {
+            // Calculate the progress percentage based on the remaining time
+            if (totalTime > 0)
+            {
+                uint8_t progress = (1.0f - (float)waitMs / totalTime) * 100;
+                if (progress > count)
+                    count = progress;
+            }
 
-    mfrc522.PICC_HaltA();
+            // Display the progress bar
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "SET_PROG(5,%d);\r\n", count);
+            Serial2.print(buffer);
 
-    beep(2000, 100); // Beep for 100ms
+            DEBUG_PRINTLN("Progress: " + String(count) + "% | waitMs: " + String(waitMs));
 
-    return true;
+            barStartTime = millis();
+        }
+        // Check if the process is completed
+        if (count >= 100 || waitMs == 0 || responseReceived)
+        {
+            hmi.display("SET_PROG(5,0)");
+            activeProcessBar = false;
+            processStarted = false;
+            count = 0;
+            DEBUG_PRINTLN("Process completed.");
+        }
+    }
 }
 
-void processDownlink(uint8_t *data, uint8_t length)
+void do_send(osjob_t *j)
 {
-    Serial.print("Received downlink: ");
+    if (LMIC.opmode & OP_TXRXPEND || strlen((char *)payload) == 0)
+    {
+        DEBUG_PRINTLN(LMIC.opmode & OP_TXRXPEND ? "OP_TXRXPEND, not sending" : "Payload is empty, not sending");
+        return;
+    }
 
-    // Convert data to string for JSON parsing
-    char jsonBuffer[64];
-    memset(jsonBuffer, 0, sizeof(jsonBuffer));
-    strncpy(jsonBuffer, (char *)data, min(length, sizeof(jsonBuffer) - 1));
-    Serial.println(jsonBuffer);
+    DEBUG_PRINTLN("JSON Payload: " + String((char *)payload));
 
-    // Parse JSON data
+    LMIC_setTxData2(1, payload, strlen((char *)payload), 0);
+    DEBUG_PRINTLN("Packet queued for transmission.");
+}
+
+void processDownlink(uint8_t *data, size_t length)
+{
+    responseReceived = true;
+    DEBUG_PRINT("Downlink data received: ");
+
+    char jsonBuffer[128];
+    size_t jsonLength = min(length, sizeof(jsonBuffer) - 1);
+    strncpy(jsonBuffer, (char *)data, jsonLength);
+    jsonBuffer[jsonLength] = '\0';
+    DEBUG_PRINTLN(jsonBuffer);
+
+    // Parse the JSON data
     StaticJsonDocument<128> doc;
     DeserializationError error = deserializeJson(doc, jsonBuffer);
 
     if (error)
     {
-        Serial.print(F("JSON Parse failed: "));
-        Serial.println(error.f_str());
+        DEBUG_PRINT("Failed to parse JSON: " + String(error.c_str()));
         return;
     }
 
     // Reading values from JSON
-    int action = doc["a"];  // Action command
-    bool result = doc["r"]; // Authentication result
+    int action = doc["a"];  // Action code
+    bool result = doc["r"]; // Result code
     if (doc.containsKey("userCode") && doc["userCode"].is<const char *>())
     {
         strncpy(userCode, doc["userCode"], sizeof(userCode) - 1);
         userCode[sizeof(userCode) - 1] = '\0';
     }
+    if (doc.containsKey("n") && doc["n"].is<const char *>())
+    {
+        strncpy(nameProduction, doc["n"], sizeof(nameProduction) - 1);
+        nameProduction[sizeof(nameProduction) - 1] = '\0';
+    }
 
-    Serial.println("Action: " + String(action));
-    Serial.println("Result: " + String(result));
-    Serial.println("userCode: " + String(userCode));
+    DEBUG_PRINTLN("Action: " + String(action));
+    DEBUG_PRINTLN("Result: " + String(result));
+    DEBUG_PRINTLN("User Code: " + String(userCode));
+    DEBUG_PRINTLN("Name Production: " + String(nameProduction));
 
-    // Processing the action
     switch (action)
     {
-    case 1: // Authenticate user
+    case 1: // User authentication
         if (result)
+        {
             authenticated = true;
+        }
         else
         {
-            notiActive = true;
-            hmi_display("SET_TXT", 1, -1, ""); // Clear user ID
-            hmi_display("SET_TXT", 3, -1, ""); // Clear password
-            showNotification("Dang nhap that bai!");
+            enableNotify = true;
+            notify("Dang nhap that bai!");
         }
         break;
-
-    case 2: // Authenticate production order
+    case 2: // Product order confirmation
         if (result)
         {
-            taskCodeConfirm = true;
-            displayProcessBar = false;
+            taskCodeConfirmed = true;
         }
         else
         {
-            notiActive = true;
-            hmi_display("SET_TXT", 0, -1, ""); // Clear production order
-            showNotification("Khong tim thay lenh san xuat!");
+            enableNotify = true;
+            notify("Khong tim thay lenh san xuat!");
         }
         break;
-
-    case 3: // Count acknowledgment (do nothing for now)
-        // No action needed if result == true
-        break;
-
-    case 4:
+    case 4: // End task confirmation
         if (result)
             loggedOut = true;
-        else
-            do_send(&sendjob);
         break;
     }
 }
@@ -278,40 +307,29 @@ void onEvent(ev_t ev)
     switch (ev)
     {
     case EV_JOINING:
-        hmi_display("SET_TXT", 0, -1, "Sending Join Request...");
+        hmi.display("SET_TXT", 0, -1, "Sending Join Request...");
         break;
     case EV_JOINED:
-        hmi_display("SET_TXT", 0, -1, "Successfully joined LoRaWAN!");
-        Serial.println("Frequency: " + String(LMIC.freq));
+        hmi.display("SET_TXT", 0, -1, "Successfully joined LoRaWAN!");
+        DEBUG_PRINTLN("Frequency: " + String(LMIC.freq));
 
-        LMIC_setLinkCheckMode(0); // Tắt kiểm tra liên kết
-
-        // Gửi dữ liệu ngay sau khi Join
+        // LMIC_setLinkCheckMode(0);
         // LMIC_setTxData2(1, (uint8_t *)"Hello", 5, 0);
         strncpy((char *)payload, "{\"a\":\"1\",\"UID\":\"12C35D1A\"}", sizeof(payload) - 1);
-        payload[sizeof(payload) - 1] = '\0'; // Ensure null termination
+        payload[sizeof(payload) - 1] = '\0';
         do_send(&sendjob);
-        // Serial.println("Đã gửi dữ liệu đầu tiên!");
         break;
     case EV_JOIN_FAILED:
-        hmi_display("SET_TXT", 0, -1, "Joining failed!");
+        hmi.display("SET_TXT", 0, -1, "Joining failed!");
         LMIC_reset();
         LMIC_startJoining();
         break;
     case EV_TXCOMPLETE:
-        Serial.println("Data sent successfully!");
-
-        Serial.println(LMIC.txrxFlags);
-        Serial.println((LMIC.txrxFlags && TXRX_ACK) ? "ACK" : "NO_ACK");
-        // Debug
-        Serial.println("LMIC.opmode: " + String(LMIC.opmode, HEX));
-
-        // if ((LMIC.txrxFlags && TXRX_ACK) && !LMIC.dataLen && currentState == LOGOUT)
-        // {
-        //     do_send(&sendjob);
-        //     Serial.println("Re-send");
-        // }
-
+        DEBUG_PRINTLN("Data sent successfully!");
+        /* TODO: Đặt 2 biến
+responseReceived = true;
+để không bị treo khi không nhận được phản hồi từ server
+*/
         if (LMIC.dataLen > 0)
             processDownlink(&LMIC.frame[LMIC.dataBeg], LMIC.dataLen);
         break;
@@ -328,136 +346,51 @@ void onEvent(ev_t ev)
         Serial.println();
         break;
     default:
-        Serial.println("Sự kiện khác...");
+        DEBUG_PRINTLN("Unknown event");
         break;
     }
 }
 
-/**
- * @brief Brief description of the function.
- *
- * @param command The command to be sent to the display.
- * @param positionObject The object representing the position.
- * @param otherObject The object representing some other data.
- * @param valueObject The object representing the value.
- */
-void hmi_display(const char *command, int arg1, int arg2, const char *value)
+void powerISR()
 {
-    char str[50];
-    if (value)
-        snprintf(str, sizeof(str), "%s(%d, '%s');\r\n", command, arg1, value);
-    else if (arg1 != -1 && arg2 != -1)
-        snprintf(str, sizeof(str), "%s(%d, %d);\r\n", command, arg1, arg2);
-    else if (arg1 != -1)
-        snprintf(str, sizeof(str), "%s(%d);\r\n", command, arg1);
-    else
-        snprintf(str, sizeof(str), "%s;\r\n", command);
-    Serial2.print(str);
-    // Serial.println(str);
-}
-
-void showNotification(const char *message)
-{
-    if (notiActive)
-    {
-        hmi_display("SET_TXT", 4, -1, message);
-        errorBeep();
-        notiStartTime = millis();
-        notiActive = false;
-    }
-}
-
-void notification_Display()
-{
-    if (!notiActive && millis() - notiStartTime >= 5000)
-    {
-        hmi_display("SET_TXT", 4, -1, "");
-        delay(130);
-        hmi_display("SET_PROG", 5, -1, 0);
-        successBeep();
-        notiActive = true;
-    }
-}
-
-void sensorISR()
-{
-    sensorCount++;
-}
-
-void powerISR(){
     if (digitalRead(POWER_DETECT_PIN) == HIGH)
         powerRestored = true;
     else
         powerLost = true;
 }
 
-void handlePowerEvent() {
-    if (powerLost) {
-      powerLost = false;
-      snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-               taskCode, userCode, sensorCount);
-      do_send(&sendjob);
-    }
-    if (powerRestored) {
-      powerRestored = false;
-      rp2040.reboot();
-    }
-  }
-  
-
-// This function handles the keypad input and updates the buffer accordingly
-// It also manages the navigation control based on the key pressed
-bool handle_keypad_input(char *buffer, uint8_t bufferSize, NavControl &navControl)
+void handlePowerEvent()
 {
-    char key = keypad.getKey();
-    if (!key)
-        return false; // No key pressed
-
-    if (key == 'A')
+    if (powerLost)
     {
-        navControl = KEY_ENTER;
-    }
-    else if (key == 'B')
-    {
-        navControl = KEY_BACKSPACE;
-        if (strlen(buffer) > 0)
-            buffer[strlen(buffer) - 1] = '\0'; // Remove last character
-    }
-    else if (key == 'C')
-    {
-        navControl = KEY_CANCEL;
-        buffer[0] = '\0';
-    }
-    else if (key == 'D')
-    {
-        navControl = KEY_SPECIAL;
-        // Handle special key action if needed
-    }
-    else
-    {
-        if (strlen(buffer) < bufferSize - 1)
-        {
-            buffer[strlen(buffer)] = key;
-            buffer[strlen(buffer) + 1] = '\0';
-        }
+        powerLost = false;
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, productCount);
+        do_send(&sendjob);
     }
 
-    beep(2000, 100); // Beep for 100ms
-
-    return true;
+    if (powerRestored)
+    {
+        powerRestored = false;
+        hmi.display("RESET()");
+        rp2040.reboot();
+    }
 }
 
-// This function handles the authentication process using either RFID or keypad input
-// It constructs a JSON payload based on the input and sends it to the server
-bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, const char *taskCode)
+void onProductDetectedISR()
 {
-    if (!rfidUid && (!userId || !*userId || !userPwd || !*userPwd) && (!taskCode || !*taskCode))
-        return false;
+    productCount++;
+}
+
+void authenticate(const char *uid, const char *userId, const char *userPwd, const char *taskCode)
+{
+    if ((!uid || !*uid) && (!userId || !*userId || !userPwd || !*userPwd) && (!taskCode || !*taskCode))
+        return;
 
     char jsonBuffer[128] = {0};
 
-    if (rfidUid)
-        snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"UID\":\"%s\"}", "1", rfidUid);
+    if (uid && *uid)
+        snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"UID\":\"%s\"}", "1", uid);
     else if (userId && *userId && userPwd && *userPwd)
         snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"code\":\"%s\",\"password\":\"%s\"}", "1", userId, userPwd);
     else if (taskCode && *taskCode)
@@ -466,390 +399,442 @@ bool authenticate(const char *userId, const char *userPwd, const char *rfidUid, 
     // Copy the JSON buffer to the payload
     memset(payload, 0, sizeof(payload));
     strncpy((char *)payload, jsonBuffer, strlen(jsonBuffer));
-    payload[strlen(jsonBuffer)] = '\0'; // Null-terminate the payload
+    payload[strlen(jsonBuffer)] = '\0';
 
-    do_send(&sendjob); // Send the payload to the server
+    do_send(&sendjob); // Send the payload to the LoRaWAN network
 
-    // Using for process Bar
-    displayProcessBar = true;
-    progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
-    barStartTime = millis();
+    activeProcessBar = true; // Set the process bar active
 
-    // Wating for the server response
-    unsigned long startTime = millis();
-    while (millis() - startTime < 30000)
+    // Wait for the response
+    uint32_t timeout = millis() + 30000; // 30 seconds timeout
+    while (millis() < timeout)
     {
-        os_runloop_once(); // Run the LMIC event loop to process events
-        if (authenticated && currentState == AUTHENTICATION)
-            return true;
-        if (taskCodeConfirm && currentState == INPUT_PRODUCTION_ORDER)
-            return true;
-
+        os_runloop_once();
         processBar();
-        notification_Display();
+        // notify();
+        if (responseReceived)
+        {
+            responseReceived = false;
+            successBeep();
+            return;
+        }
     }
-
-    return false; // Authentication failed
+    errorBeep();
+    DEBUG_PRINTLN("Timeout waiting for response");
 }
 
-// This function handles the input of the production order and updates the state accordingly
-void input_production_order()
+void rfidLogin()
 {
+    if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
+        return;
+
+    beep();
+
+    // Read UID from RFID card
+    char uid[9];
+    for (byte i = 0; i < mfrc522.uid.size; i++)
+        sprintf(&uid[i * 2], "%02X", mfrc522.uid.uidByte[i]);
+    uid[mfrc522.uid.size * 2] = '\0'; // Null-terminate the string
+    DEBUG_PRINTLN("RFID UID: " + String(uid));
+    mfrc522.PICC_HaltA();
+
+    authenticate(uid, nullptr, nullptr, nullptr);
+}
+
+bool handleKeypadInput(char *buffer, size_t bufferSize, NavControl &navControl)
+{
+    char key = keypad.getKey();
+    if (!key)
+        return false;
+
+    beep();
+    size_t len = strlen(buffer);
+
+    if (key == 'A') // Enter key
+    {
+        navControl = KEY_ENTER;
+    }
+    else if (key == 'B') // Backspace key
+    {
+        navControl = KEY_BACKSPACE;
+        if (len > 0)
+            buffer[len - 1] = '\0'; // Remove last character
+    }
+    else if (key == 'C') // Cancel key
+    {
+        navControl = KEY_CANCEL;
+        buffer[0] = '\0';
+    }
+    else if (key == 'D') // Special key
+    {
+        navControl = KEY_SPECIAL;
+    }
+    else
+    {
+        if (len < bufferSize - 1)
+        {
+            buffer[len] = key;
+            buffer[len + 1] = '\0';
+        }
+    }
+    return true;
+}
+
+void checkDiagnosticAccess()
+{
+    static char accessCode[8] = {0};
+    static uint32_t timeout = millis() + 10000;
     NavControl navControl = NONE;
-    if (handle_keypad_input(taskCode, PROD_ORDER_LENGTH + 1, navControl))
+    while (millis() < timeout)
     {
-        hmi_display("SET_TXT", 0, -1, taskCode);
-        if (navControl == KEY_ENTER)
+        handleKeypadInput(accessCode, sizeof(accessCode), navControl);
+        if (navControl == KEY_ENTER && strcmp(accessCode, "/100/") == 0)
         {
-            if (authenticate(nullptr, nullptr, nullptr, taskCode))
-            {
-                pphStartTime = millis();
-                hmi_display("JUMP(1)");
-                // delay(180);
-                check_busy();
-                hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
-                // delay(180);
-                check_busy();
-                hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
-                // delay(180);
-                check_busy();
-                attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
-                sensorCount = 0;
-                taskCodeConfirm = false;
-                currentState = COUNTING; // Go to counting state
-                successBeep();
-            }
-            else
-            {
-                hmi_display("SET_TXT", 0, -1, ""); // Clear production order
-                memset(taskCode, 0, PROD_ORDER_LENGTH);
-            }
-        }
-        else if (navControl == KEY_CANCEL)
-        {
-            hmi_display("JUMP(2)");
-            authenticated = false;
-            memset(taskCode, 0, PROD_ORDER_LENGTH);
-            currentState = AUTHENTICATION; // Go back to authentication state
+            memset(accessCode, 0, sizeof(accessCode));
+            hmi.display("JUMP(6)");
+            currentState = DIAGNOSTIC_TEST;
+            break;
         }
     }
 }
 
-void clear_field_credentials(char *userId, size_t userIdLen, char *userPwd, size_t userPwdLen, bool &isEnteringPassword)
-{
-    hmi_display("SET_TXT", 1, -1, "");
-    hmi_display("SET_TXT", 3, -1, "");
-    memset(userId, 0, userIdLen);
-    memset(userPwd, 0, userPwdLen);
-    isEnteringPassword = false;
-}
+void handleDiagnosticTest() {
+    static const uint8_t message[] = "Test";
+    static uint32_t lastSend = 0;
 
-// This function handles the input of credentials (either RFID or keypad) and returns true if authentication is successful
-// It uses the RFID reader to read the UID and the keypad for user ID and password input
-bool input_credentials()
-{
-    char rfidUid[4] = {0};
-    if (read_RFID(rfidUid))
-    {
-        if (authenticate(nullptr, nullptr, rfidUid, nullptr))
-            return true; // RFID authentication successful
+    if (millis() - lastSend > 20000) {
+        lastSend = millis();
+        strncpy((char *)payload, (const char *)message, sizeof(payload) - 1);
+        payload[sizeof(payload) - 1] = '\0';
+        do_send(&sendjob);
     }
 
-    if (authenticated)
-        return true;
+    if (LMIC.dataLen) {
+        LMIC.dataLen = 0;
 
+        int rssi = LMIC.rssi;                 // đơn vị: dBm
+        float snr = LMIC.snr / 4.0;           // LMIC.snr là đơn vị .25dB
+
+        hmi.display("SET_TXT", 1, -1, ("RSSI: " + String(rssi) + "dBm").c_str());
+        hmi.display("SET_TXT", 3, -1, (" SNR: " + String(snr, 2) + "dB").c_str());
+
+        String quality;
+        if (rssi > -80 && snr > 7) {
+            quality = "Excellent";
+        } else if (rssi > -90 && snr > 0) {
+            quality = "Good";
+        } else if (rssi > -100 && snr > -7) {
+            quality = "Fair";
+        } else if (rssi > -110 || snr > -10) {
+            quality = "Poor";
+        } else {
+            quality = "Very Poor";
+        }
+
+        hmi.display("SET_TXT", 2, -1, quality.c_str());
+    }
+
+    if (keypad.getKey() == 'C') {
+        currentState = AUTHENTICATION;
+    }
+}
+
+void keypadLogin()
+{
     static bool isEnteringPassword = false;
-    static char userId[USER_ID_LENGTH + 1] = "";
-    static char userPwd[USER_PWD_LENGTH + 1] = "";
+    static char userId[USER_ID_LENGTH + 1] = {0};
+    static char userPwd[USER_PWD_LENGTH + 1] = {0};
 
     NavControl navControl = NONE;
     char *targetInput = isEnteringPassword ? userPwd : userId;
     size_t inputLen = isEnteringPassword ? USER_PWD_LENGTH + 1 : USER_ID_LENGTH + 1;
 
-    if (handle_keypad_input(targetInput, inputLen, navControl))
+    if (handleKeypadInput(targetInput, inputLen, navControl))
     {
         if (isEnteringPassword)
         {
             char maskPassword[USER_PWD_LENGTH + 1] = "";
             memset(maskPassword, '*', strlen(userPwd));
-            hmi_display("SET_TXT", 3, -1, maskPassword);
+            hmi.display("SET_TXT", 3, -1, maskPassword);
         }
         else
         {
-            hmi_display("SET_TXT", 1, -1, userId);
+            hmi.display("SET_TXT", 1, -1, userId);
         }
     }
 
-    // Handle function keys
+    bool shouldClerarField = false;
+
     switch (navControl)
     {
     case KEY_ENTER:
-        if (!isEnteringPassword)
+        if (isEnteringPassword)
         {
-            isEnteringPassword = true;
-            memset(userPwd, 0, USER_PWD_LENGTH + 1);
+            authenticate(nullptr, userId, userPwd, nullptr);
+            shouldClerarField = true;
         }
         else
         {
-            bool success = authenticate(userId, userPwd, nullptr, nullptr);
-            clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
-            return success;
+            isEnteringPassword = true;
         }
         break;
-
     case KEY_CANCEL:
-        clear_field_credentials(userId, USER_ID_LENGTH + 1, userPwd, USER_PWD_LENGTH + 1, isEnteringPassword);
-        return false;
+        shouldClerarField = true;
+        break;
+    case KEY_SPECIAL:
+        checkDiagnosticAccess();
+        break;
     }
 
-    // Clear buffer
-    handle_keypad_input(nullptr, 0, navControl);
-
-    return false;
+    if (shouldClerarField)
+    {
+        hmi.display("SET_TXT", 1, -1, "");
+        hmi.display("SET_TXT", 3, -1, "");
+        memset(userId, 0, sizeof(userId));
+        memset(userPwd, 0, sizeof(userPwd));
+        isEnteringPassword = false;
+    }
 }
 
-// This function checks if the user is authenticated and updates the state accordingly
 void handleAuthentication()
 {
-    if (input_credentials())
+    rfidLogin();
+    keypadLogin();
+
+    static bool checkInfo = false;
+    if (authenticated)
     {
-        if (authenticated)
-        {
-            hmi_display("JUMP(4)");
-            hmi_display("JUMP(4)"); // Go to production order input state
-            authenticated = false;
-            currentState = INPUT_PRODUCTION_ORDER;
-        }
+        checkInfo = true;
+        hmi.display("JUMP(4)");
+        currentState = INPUT_PRODUCTION_ORDER;
+        authenticated = false;
     }
+
+    if (checkInfo)
+    {
+    }
+}
+
+void inputProductionOrder()
+{
+    NavControl navControl = NONE;
+    if (handleKeypadInput(taskCode, TASK_CODE_LENGTH + 1, navControl))
+    {
+        hmi.display("SET_TXT", 1, -1, taskCode);
+    }
+
+    if (navControl == KEY_ENTER)
+    {
+        authenticate(nullptr, nullptr, nullptr, taskCode);
+        hmi.display("SET_TXT", 1, -1, "");
+    }
+}
+
+void fillCountingFields()
+{
+    hmi.display("JUMP(1)");
+    hmi.display("SET_TXT", 1, -1, userCode);
+    hmi.display("SET_TXT", 5, -1, taskCode);
+    hmi.display("SET_TXT", 7, -1, nameProduction);
+}
+
+void confirmProductionOrder()
+{
+    inputProductionOrder();
+
+    if (taskCodeConfirmed)
+    {
+        fillCountingFields();
+
+        productCount = 0;
+        countingStartTime = millis();
+        currentState = COUNTING;
+        taskCodeConfirmed = false;
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+    }
+}
+
+String formatNumberWithCommas(long number)
+{
+    String numStr = String(number);
+    int insertPosition = numStr.length() - 3;
+
+    while (insertPosition > 0)
+    {
+        numStr = numStr.substring(0, insertPosition) + "." + numStr.substring(insertPosition);
+        insertPosition -= 3;
+    }
+
+    return numStr;
 }
 
 void handleCounting()
 {
-    if (sensorCount != lastSensorCount)
-    {
-        lastSensorCount = sensorCount;
-        hmi_display("SET_TXT", 2, -1, String(sensorCount).c_str());
+    static unsigned long lastPPHUpdate = 0;
 
-        unsigned long duration = millis() - pphStartTime;
-        if (sensorCount >= 10 && duration >= 10000){
-            long pph = (sensorCount * 3600) / (duration / 1000);
-            hmi_display("SET_TXT", 4, -1, ("PPH: " + String(pph)).c_str());
+    if (productCount > lastProductCount)
+    {
+        lastProductCount = productCount;
+        String countStr = formatNumberWithCommas(productCount);
+        hmi.display("SET_TXT", 2, -1, countStr.c_str());
+
+        unsigned long duration = millis() - countingStartTime;
+        if (productCount >= 10 && duration >= 10000)
+        {
+            unsigned long now = millis();
+            if (now - lastPPHUpdate >= 20000)
+            {
+                long pph = (productCount * 3600) / (duration / 1000);
+                hmi.display("SET_TXT", 4, -1, ("PPH: " + String(pph)).c_str());
+                lastPPHUpdate = now;
+            }
         }
     }
 
-    static unsigned long lastSendTime = millis();
+    static uint32_t lastSendTime = millis();
     if (millis() - lastSendTime >= TX_INTERVAL)
     {
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"3\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-                 taskCode, userCode, sensorCount);
-        do_send(&sendjob);
         lastSendTime = millis();
+        snprintf((char *)payload, sizeof(payload), "{\"a\":\"3\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, productCount);
+        do_send(&sendjob);
     }
 
-    if (keypad.getKey() == 'D')
+    NavControl navControl = NONE;
+    handleKeypadInput(nullptr, 0, navControl);
+    if (navControl == KEY_SPECIAL)
     {
         detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
+        hmi.display("JUMP(5)");
         currentState = LOGOUT;
-        beep(2000, 100); // Beep for 100ms
-        hmi_display("JUMP(5)");
-        check_busy();
     }
 }
 
 void handleLogout()
 {
     NavControl navControl = NONE;
-    handle_keypad_input(nullptr, 0, navControl);
+    handleKeypadInput(nullptr, 0, navControl);
     if (navControl == KEY_ENTER)
     {
-        displayProcessBar = true;
-        progressStarted = false; // Đặt lại để processBar tự lấy totalTime mới
-        barStartTime = millis();
         snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-                 taskCode, userCode, sensorCount);
+                 taskCode, userCode, productCount);
         do_send(&sendjob); // Send data before logout
+
+        activeProcessBar = true;
     }
     else if (navControl == KEY_CANCEL)
     {
-        hmi_display("JUMP(1)");
-        // delay(130);
-        check_busy();
-        hmi_display("SET_TXT", 6, -1, taskCode); // Add production order display
-        // delay(130);
-        check_busy();
-        hmi_display("SET_TXT", 1, -1, userCode); // Add UID display
-        // delay(130);
-        check_busy();
-        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
-        currentState = COUNTING; // Go to counting state
+        fillCountingFields();
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+        currentState = COUNTING;
     }
 
     if (loggedOut)
     {
-        hmi_display("JUMP(2)");
-        loggedOut = false;
+        hmi.display("JUMP(2)");
         memset(taskCode, 0, sizeof(taskCode));
-        currentState = AUTHENTICATION; // Go back to authentication state
-    }
-    processBar();
-}
-
-void do_send(osjob_t *j)
-{
-    if (LMIC.opmode & OP_TXRXPEND || strlen((char *)payload) == 0)
-    {
-        Serial.println(F(LMIC.opmode & OP_TXRXPEND ? "OP_TXRXPEND, not sending" : "Payload is empty, not sending"));
-        return;
-    }
-
-    Serial.println("JSON Payload: " + String((char *)payload));
-
-    LMIC_setTxData2(1, payload, strlen((char *)payload), 0);
-    Serial.println("Packet queued for transmission.");
-}
-
-void processBar()
-{
-    static uint8_t count = 0;
-
-    if (displayProcessBar)
-    {
-        uint32_t waitMs = lmic_time_until_next_tx_ms();
-
-        // Lấy totalTime một lần duy nhất khi mới bắt đầu
-        if (!progressStarted && waitMs > 0)
-        {
-            totalTime = waitMs;
-            progressStarted = true;
-            count = 0; // Đảm bảo bắt đầu từ 0%
-        }
-
-        // Cập nhật progress mỗi 300ms
-        if (millis() - barStartTime >= 300)
-        {
-            // Tính phần trăm tiến độ dựa vào thời gian còn lại
-            if (totalTime > 0)
-            {
-                uint8_t progress = (1.0f - (float)waitMs / totalTime) * 100;
-
-                if (progress > count)
-                    count = progress;
-            }
-
-            // Gửi lệnh cập nhật HMI
-            char buffer[32];
-            snprintf(buffer, sizeof(buffer), "SET_PROG(5,%d);\r\n", count);
-            Serial2.print(buffer);
-
-            Serial.print("Progress: ");
-            Serial.print(count);
-            Serial.print("% | waitMs: ");
-            Serial.println(waitMs);
-
-            barStartTime = millis();
-            if (count <= 0)
-                successBeep();
-        }
-
-        // Nếu đã hoàn thành
-        if (count >= 100 || waitMs == 0)
-        {
-            count = 0;
-            displayProcessBar = false;
-            progressStarted = false;
-        }
+        memset(userCode, 0, sizeof(userCode));
+        currentState = AUTHENTICATION;
+        loggedOut = false;
     }
 }
 
-void setup()
+void initLoRaWAN()
 {
-    Serial.begin(115200);
-    delay(2000);
-    // while (!Serial)
-    //     ;
+    DEBUG_PRINTLN("Initializing LoRaWAN...");
 
-    // Init for hmi display
-    gpio_set_function(8, GPIO_FUNC_UART); // TX(8) --> TX Display
-    gpio_set_function(9, GPIO_FUNC_UART); // RX(9) --> RX Display
-    Serial2.begin(115200);
-    while (!Serial2)
-        ;
-    hmi_display("JUMP(3)");
-    hmi_display("JUMP(3)");
-    hmi_display("SET_TXT", 0, -1, "System starting...");
-    delay(130);
-
-    pinMode(SENSOR_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, RISING);
-    pinMode(POWER_DETECT_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(POWER_DETECT_PIN), powerISR, CHANGE); // Trigger on power loss
-
-    // Init for keypad
-    Wire.begin();
-    keypad.begin();
-    hmi_display("SET_TXT", 0, -1, "Keypad initialized");
-    delay(130);
-
-    // Init for MFRC522
-    SPI.begin();
-    mfrc522.PCD_Init();
-    hmi_display("SET_TXT", 0, -1, "RFID reader initialized");
-    delay(130);
-
-    // Configuration for Lora
+    // Configuration for SPI1
     gpio_set_function(10, GPIO_FUNC_SPI);
     gpio_set_function(11, GPIO_FUNC_SPI);
     gpio_set_function(12, GPIO_FUNC_SPI);
     SPI1.begin();
 
+    // Get the unique DevEUI from the RP2040 board ID
+    getDevEUIFromRP2040();
+
+    // Initialize LMIC
     os_init();
-    get_boardID();
     LMIC_reset();
-    LMIC_setAdrMode(0); // Disable ADR
-    LMIC_setDrTxpow(DR_SF7, 14);
 
     // Congigure AS923 channels
     // for (int i = 0; i < 8; i++)
-    // {
-    //     LMIC_setupChannel(i, 922000000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
-    // }
+    //     LMIC_setupChannel(i, 923200000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
     LMIC_setupChannel(0, 923200000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
     LMIC_setupChannel(1, 923400000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
-    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
 
-    // Ensure Class C operation is configured correctly
+    LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+    LMIC_setAdrMode(0);       // Disable ADR
     LMIC_setLinkCheckMode(0); // Disable link check mode
-    LMIC.dn2Dr = DR_SF9;      // Set RX2 data rate for Class C
-    LMIC.rxDelay = 100;       // Set RX delay
+    LMIC_setDrTxpow(DR_SF7, 14);
+    LMIC.dn2Dr = DR_SF9; // Set RX2 data rate for Class C
+    LMIC.rxDelay = 100;  // Set RX delay
     // LMIC.globalDutyRate = 0; // Disable duty cycle
 
     LMIC_startJoining();
-
-    // Wait for joining successful
-    unsigned long startTime = millis();
+    uint32_t timeout = millis() + 20000; // 20 seconds timeout
     while (LMIC.devaddr == 0)
     {
         os_runloop_once();
-        if (millis() - startTime > 30000)
+        if (millis() > timeout)
         {
-            Serial.print("Joining failed!");
+            DEBUG_PRINTLN("Joining failed, retrying...");
             rp2040.reboot();
-            break;
         }
     }
+    delay(1000);
+}
 
-    delay(2000);
-    hmi_display("JUMP(2)");
+void setup()
+{
+    DEBUG_BEGIN(1152000);
+    DEBUG_WAIT();
+
+    // Interrupt for power detection
+    pinMode(POWER_DETECT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(POWER_DETECT_PIN), powerISR, CHANGE);
+
+    // Interrupt for product counting
+    pinMode(SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+
+    // Initialize serial communication for HMI
+    gpio_set_function(8, GPIO_FUNC_UART); // TX(8) --> TX Display
+    gpio_set_function(9, GPIO_FUNC_UART); // RX(9) --> RX Display
+    Serial2.begin(115200);
+    while (!Serial2)
+        ;
+    delay(200);
+    Serial2.print("RESET();\r\n");
+    hmi.display("RESET()");
+    hmi.process();
+    // hmi.display("JUMP(3)");
+    hmi.display("SET_TXT", 0, -1, "System starting...");
+
+    // Initialize SPI and RFID reader
+    SPI.begin();
+    mfrc522.PCD_Init();
+    hmi.display("SET_TXT", 0, -1, "RFID reader initialized");
+
+    // Initialize I2C for keypad
+    Wire.begin();
+    keypad.begin();
+    hmi.display("SET_TXT", 0, -1, "Keypad initialized");
+
+    // Initialize LoRaWAN
+    initLoRaWAN();
+
     detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));
     successBeep();
+    hmi.display("JUMP(2)");
 }
 
 void loop()
 {
     os_runloop_once();
-    // notification_Display();
-    processBar();
     handlePowerEvent();
+    // processBar();
+    notify();
+    hmi.process();
 
     switch (currentState)
     {
@@ -857,7 +842,7 @@ void loop()
         handleAuthentication();
         break;
     case INPUT_PRODUCTION_ORDER:
-        input_production_order();
+        confirmProductionOrder();
         break;
     case COUNTING:
         handleCounting();
@@ -865,30 +850,8 @@ void loop()
     case LOGOUT:
         handleLogout();
         break;
+    case DIAGNOSTIC_TEST:
+        handleDiagnosticTest();
+        break;
     }
 }
-
-/*
- * @brief This code is a simple Arduino sketch for a system that uses a LoRaWAN module to send data to a server.
- * It includes functionalities for user authentication, production order input, and counting.
- * The system uses an RFID reader and a keypad for user input, and it displays information on an HMI display.
- * The code also handles power loss scenarios and sends data accordingly.
- *
- * @note The code is designed to run on a Raspberry Pi Pico board and uses the MCCI LoRaWAN LMIC library for LoRa communication.
- * It also uses the MFRC522 library for RFID reading and a custom keypad library for I2C keypad input.
- * The code is structured into several functions to handle different tasks, including sending data, processing downlink messages, and managing the state of the system.
- * The system is designed to be modular and can be easily extended or modified for different use cases.
- *
- * Wiring:
- * - MFRC522 RFID reader: CS pin to GPIO 17, RST pin to GPIO 20, MISO pin to GPIO 16, MOSI pin to GPIO 19, SCK pin to GPIO 18
- * - Keypad: I2C address 0x26, SDA pin to GPIO 4, SCL pin to GPIO 5
- * - LoRa module: SPI pins to GPIO 10, 11, 12 (SCK, MOSI, MISO), CS pin to GPIO 13, RST pin to GPIO 14
- * - HMI display: TX pin to GPIO 8, RX pin to GPIO 9
- * - Sensor pin: GPIO 23 (interrupt pin for counting)
- * - ADC pin: GPIO 26 (for power loss detection)
- *
- * @note Set the frequency for AS923 by editing the project_config file in the MCCI LoRaWAN LMIC library.
- */
-
-/*
- */

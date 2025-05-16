@@ -3,7 +3,7 @@
     <frame frame="frame">
         <frameW>320</frameW>
         <frameH>240</frameH>
-        <parentImageNum>0</parentImageNum>
+        <parentImageNum>6</parentImageNum>
         <parentBackgroundNum>15</parentBackgroundNum>
         <screenType>1</screenType>
         <dpi>240*320(QVGA-1)</dpi>
@@ -16,7 +16,7 @@
         <logow>0</logow>
         <logoh>0</logoh>
         <logotime>0</logotime>
-        <currentPage>3</currentPage>
+        <currentPage>6</currentPage>
     </frame>
     <page id="1">
         <pageImageNum pageImageNum="5"/>

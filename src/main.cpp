@@ -498,43 +498,54 @@ void checkDiagnosticAccess()
     }
 }
 
-void handleDiagnosticTest() {
+void handleDiagnosticTest()
+{
     static const uint8_t message[] = "Test";
     static uint32_t lastSend = 0;
 
-    if (millis() - lastSend > 20000) {
+    if (millis() - lastSend > 20000)
+    {
         lastSend = millis();
         strncpy((char *)payload, (const char *)message, sizeof(payload) - 1);
         payload[sizeof(payload) - 1] = '\0';
         do_send(&sendjob);
     }
-
-    if (LMIC.dataLen) {
+    if (LMIC.dataLen)
+    {
+        // Cập nhật RSSI/SNR
+        int rssi = LMIC.rssi;
+        float snr = LMIC.snr / 4.0;
         LMIC.dataLen = 0;
 
-        int rssi = LMIC.rssi;                 // đơn vị: dBm
-        float snr = LMIC.snr / 4.0;           // LMIC.snr là đơn vị .25dB
+        // Xóa dòng cũ
+        hmi.display("SET_TXT", 1, -1, "");
+        hmi.display("SET_TXT", 2, -1, "");
+        hmi.display("SET_TXT", 3, -1, "");
 
+        // Ghi dữ liệu mới
         hmi.display("SET_TXT", 1, -1, ("RSSI: " + String(rssi) + "dBm").c_str());
         hmi.display("SET_TXT", 3, -1, (" SNR: " + String(snr, 2) + "dB").c_str());
 
         String quality;
-        if (rssi > -80 && snr > 7) {
+        if (rssi > -80 && snr > 7)
             quality = "Excellent";
-        } else if (rssi > -90 && snr > 0) {
+        else if (rssi > -90 && snr > 0)
             quality = "Good";
-        } else if (rssi > -100 && snr > -7) {
+        else if (rssi > -100 && snr > -7)
             quality = "Fair";
-        } else if (rssi > -110 || snr > -10) {
+        else if (rssi > -110 || snr > -10)
             quality = "Poor";
-        } else {
+        else
             quality = "Very Poor";
-        }
 
         hmi.display("SET_TXT", 2, -1, quality.c_str());
-    }
 
-    if (keypad.getKey() == 'C') {
+        // Ghi thời điểm cập nhật
+        String timestamp = "Updated: " + String(millis() / 1000) + "s";
+        hmi.display("SET_TXT", 0, -1, timestamp.c_str());
+    }
+    if (keypad.getKey() == 'C'){
+        hmi.display("JUMP(2)");
         currentState = AUTHENTICATION;
     }
 }
@@ -601,17 +612,11 @@ void handleAuthentication()
     rfidLogin();
     keypadLogin();
 
-    static bool checkInfo = false;
     if (authenticated)
     {
-        checkInfo = true;
         hmi.display("JUMP(4)");
         currentState = INPUT_PRODUCTION_ORDER;
         authenticated = false;
-    }
-
-    if (checkInfo)
-    {
     }
 }
 
@@ -787,7 +792,7 @@ void initLoRaWAN()
 void setup()
 {
     DEBUG_BEGIN(1152000);
-    DEBUG_WAIT();
+    // DEBUG_WAIT();
 
     // Interrupt for power detection
     pinMode(POWER_DETECT_PIN, INPUT_PULLUP);

@@ -54,6 +54,9 @@ bool authenticated = false;
 bool taskCodeConfirmed = false;
 volatile bool responseReceived = false;
 
+// Variable for diagnostic Test
+bool inputCodeTimeoutReset = false;
+
 enum State
 {
     AUTHENTICATION,
@@ -297,7 +300,9 @@ void processDownlink(uint8_t *data, size_t length)
         break;
     case 4: // End task confirmation
         if (result)
+        {
             loggedOut = true;
+        }
         break;
     }
 }
@@ -326,10 +331,7 @@ void onEvent(ev_t ev)
         break;
     case EV_TXCOMPLETE:
         DEBUG_PRINTLN("Data sent successfully!");
-        /* TODO: Đặt 2 biến
-responseReceived = true;
-để không bị treo khi không nhận được phản hồi từ server
-*/
+
         if (LMIC.dataLen > 0)
             processDownlink(&LMIC.frame[LMIC.dataBeg], LMIC.dataLen);
         break;
@@ -382,9 +384,9 @@ void onProductDetectedISR()
     productCount++;
 }
 
-void authenticate(const char *uid, const char *userId, const char *userPwd, const char *taskCode)
+void authenticate(const char *uid, const char *userId, const char *userPwd, const char *taskCode, bool isTaskDone = false)
 {
-    if ((!uid || !*uid) && (!userId || !*userId || !userPwd || !*userPwd) && (!taskCode || !*taskCode))
+    if ((!uid || !*uid) && (!userId || !*userId || !userPwd || !*userPwd) && (!taskCode || !*taskCode) && !isTaskDone)
         return;
 
     char jsonBuffer[128] = {0};
@@ -393,8 +395,11 @@ void authenticate(const char *uid, const char *userId, const char *userPwd, cons
         snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"UID\":\"%s\"}", "1", uid);
     else if (userId && *userId && userPwd && *userPwd)
         snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"code\":\"%s\",\"password\":\"%s\"}", "1", userId, userPwd);
-    else if (taskCode && *taskCode)
+    else if (taskCode && *taskCode && !isTaskDone)
         snprintf(jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"%s\",\"taskCode\":\"%s\",\"userCode\":\"%s\"}", "2", taskCode, userCode);
+    else if (isTaskDone)
+        snprintf((char *)jsonBuffer, sizeof(jsonBuffer), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
+                 taskCode, userCode, productCount);
 
     // Copy the JSON buffer to the payload
     memset(payload, 0, sizeof(payload));
@@ -483,7 +488,9 @@ bool handleKeypadInput(char *buffer, size_t bufferSize, NavControl &navControl)
 void checkDiagnosticAccess()
 {
     static char accessCode[8] = {0};
-    static uint32_t timeout = millis() + 10000;
+    static uint32_t timeout = 0;
+    if (inputCodeTimeoutReset)
+        timeout = millis() + 10000;
     NavControl navControl = NONE;
     while (millis() < timeout)
     {
@@ -496,6 +503,7 @@ void checkDiagnosticAccess()
             break;
         }
     }
+    inputCodeTimeoutReset = false;
 }
 
 void handleDiagnosticTest()
@@ -508,7 +516,7 @@ void handleDiagnosticTest()
         lastSend = millis();
         strncpy((char *)payload, (const char *)message, sizeof(payload) - 1);
         payload[sizeof(payload) - 1] = '\0';
-        do_send(&sendjob);
+        LMIC_setTxData2(1, payload, strlen((char *)payload), 1);
     }
     if (LMIC.dataLen)
     {
@@ -544,7 +552,8 @@ void handleDiagnosticTest()
         String timestamp = "Updated: " + String(millis() / 1000) + "s";
         hmi.display("SET_TXT", 0, -1, timestamp.c_str());
     }
-    if (keypad.getKey() == 'C'){
+    if (keypad.getKey() == 'C')
+    {
         hmi.display("JUMP(2)");
         currentState = AUTHENTICATION;
     }
@@ -593,6 +602,7 @@ void keypadLogin()
         shouldClerarField = true;
         break;
     case KEY_SPECIAL:
+        inputCodeTimeoutReset = true;
         checkDiagnosticAccess();
         break;
     }
@@ -637,9 +647,9 @@ void inputProductionOrder()
 
 void fillCountingFields()
 {
-    hmi.display("JUMP(1)");
-    hmi.display("SET_TXT", 1, -1, userCode);
-    hmi.display("SET_TXT", 5, -1, taskCode);
+    hmi.display("JUMP(1)"); 
+    hmi.display("SET_TXT", 1, -1, userCode); 
+    hmi.display("SET_TXT", 5, -1, taskCode); 
     hmi.display("SET_TXT", 7, -1, nameProduction);
 }
 
@@ -649,13 +659,13 @@ void confirmProductionOrder()
 
     if (taskCodeConfirmed)
     {
-        fillCountingFields();
-
         productCount = 0;
         countingStartTime = millis();
         currentState = COUNTING;
         taskCodeConfirmed = false;
         attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+        hmi.clearQueue();
+        fillCountingFields();
     }
 }
 
@@ -721,11 +731,8 @@ void handleLogout()
     handleKeypadInput(nullptr, 0, navControl);
     if (navControl == KEY_ENTER)
     {
-        snprintf((char *)payload, sizeof(payload), "{\"a\":\"4\",\"taskCode\":\"%s\",\"userCode\":\"%s\",\"total\":%d}",
-                 taskCode, userCode, productCount);
-        do_send(&sendjob); // Send data before logout
-
-        activeProcessBar = true;
+        // bool isTaskDone = true;
+        authenticate(nullptr, userCode, nullptr, taskCode, 1);
     }
     else if (navControl == KEY_CANCEL)
     {
@@ -791,7 +798,7 @@ void initLoRaWAN()
 
 void setup()
 {
-    DEBUG_BEGIN(1152000);
+    DEBUG_BEGIN(115200);
     // DEBUG_WAIT();
 
     // Interrupt for power detection

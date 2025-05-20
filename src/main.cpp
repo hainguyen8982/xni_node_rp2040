@@ -46,7 +46,7 @@ bool processStarted = false;
 // Variables using storage
 char userCode[USER_ID_LENGTH + 1] = {0};
 char taskCode[TASK_CODE_LENGTH + 1] = {0};
-char nameProduction[32] = {0};
+char productName[32] = {0};
 
 // Varialble for authentication
 bool loggedOut = false;
@@ -114,6 +114,8 @@ uint32_t lmic_time_until_next_tx_ms()
         return 0;
     }
 }
+
+void authenticate(const char *uid, const char *userId, const char *userPwd, const char *taskCode, bool isTaskDone);
 
 void getDevEUIFromRP2040()
 {
@@ -265,14 +267,14 @@ void processDownlink(uint8_t *data, size_t length)
     }
     if (doc.containsKey("n") && doc["n"].is<const char *>())
     {
-        strncpy(nameProduction, doc["n"], sizeof(nameProduction) - 1);
-        nameProduction[sizeof(nameProduction) - 1] = '\0';
+        strncpy(productName, doc["n"], sizeof(productName) - 1);
+        productName[sizeof(productName) - 1] = '\0';
     }
 
     DEBUG_PRINTLN("Action: " + String(action));
     DEBUG_PRINTLN("Result: " + String(result));
     DEBUG_PRINTLN("User Code: " + String(userCode));
-    DEBUG_PRINTLN("Name Production: " + String(nameProduction));
+    DEBUG_PRINTLN("Name Production: " + String(productName));
 
     switch (action)
     {
@@ -296,6 +298,11 @@ void processDownlink(uint8_t *data, size_t length)
         {
             enableNotify = true;
             notify("Khong tim thay lenh san xuat!");
+        }
+        break;
+    case 3:
+        if (currentState == LOGOUT){
+            authenticate(nullptr, userCode, nullptr, taskCode, 1);
         }
         break;
     case 4: // End task confirmation
@@ -409,6 +416,7 @@ void authenticate(const char *uid, const char *userId, const char *userPwd, cons
     do_send(&sendjob); // Send the payload to the LoRaWAN network
 
     activeProcessBar = true; // Set the process bar active
+    processStarted = false; // Reset the process bar state
 
     // Wait for the response
     uint32_t timeout = millis() + 30000; // 30 seconds timeout
@@ -650,7 +658,7 @@ void fillCountingFields()
     hmi.display("JUMP(1)"); 
     hmi.display("SET_TXT", 1, -1, userCode); 
     hmi.display("SET_TXT", 5, -1, taskCode); 
-    hmi.display("SET_TXT", 7, -1, nameProduction);
+    hmi.display("SET_TXT", 7, -1, productName);
 }
 
 void confirmProductionOrder()
@@ -687,7 +695,7 @@ void handleCounting()
 {
     static unsigned long lastPPHUpdate = 0;
 
-    if (productCount > lastProductCount)
+    if (productCount != lastProductCount)
     {
         lastProductCount = productCount;
         String countStr = formatNumberWithCommas(productCount);
@@ -731,7 +739,6 @@ void handleLogout()
     handleKeypadInput(nullptr, 0, navControl);
     if (navControl == KEY_ENTER)
     {
-        // bool isTaskDone = true;
         authenticate(nullptr, userCode, nullptr, taskCode, 1);
     }
     else if (navControl == KEY_CANCEL)
@@ -746,6 +753,7 @@ void handleLogout()
         hmi.display("JUMP(2)");
         memset(taskCode, 0, sizeof(taskCode));
         memset(userCode, 0, sizeof(userCode));
+        memset(productName, 0, sizeof(productName));
         currentState = AUTHENTICATION;
         loggedOut = false;
     }
@@ -769,10 +777,10 @@ void initLoRaWAN()
     LMIC_reset();
 
     // Congigure AS923 channels
-    // for (int i = 0; i < 8; i++)
-    //     LMIC_setupChannel(i, 923200000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
-    LMIC_setupChannel(0, 923200000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
-    LMIC_setupChannel(1, 923400000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
+    for (int i = 0; i < 8; i++)
+        LMIC_setupChannel(i, 923200000 + i * 200000, DR_RANGE_MAP(DR_SF12, DR_SF7), BAND_CENTI);
+    // LMIC_setupChannel(0, 923200000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
+    // LMIC_setupChannel(1, 923400000, DR_RANGE_MAP(DR_SF7, DR_SF7), BAND_CENTI);
 
     LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
     LMIC_setAdrMode(0);       // Disable ADR

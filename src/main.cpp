@@ -33,7 +33,7 @@ volatile bool powerRestored = false;
 constexpr int SENSOR_PIN = 28;
 uint32_t countingStartTime = 0;
 uint16_t lastProductCount = 0;
-volatile uint16_t productCount = 0;
+volatile unsigned long productCount = 0;
 
 // Varialble for notification
 bool enableNotify = false;
@@ -100,6 +100,7 @@ const lmic_pinmap lmic_pins = {
 uint8_t payload[128];
 static osjob_t sendjob;
 const unsigned TX_INTERVAL = 30000; // 30 seconds
+// unsigned long interval = 5 * 60 * 1000UL + random(0, 30000); // 5 minutes + random 0-30 seconds
 
 uint32_t lmic_time_until_next_tx_ms()
 {
@@ -460,38 +461,47 @@ bool handleKeypadInput(char *buffer, size_t bufferSize, NavControl &navControl)
     if (!key)
         return false;
 
-    beep();
-    size_t len = strlen(buffer);
+    beep();  
 
-    if (key == 'A') // Enter key
+    size_t len = 0;
+    if (buffer)
+        len = strlen(buffer);
+
+    switch (key)
     {
+    case 'A': // Enter
         navControl = KEY_ENTER;
-    }
-    else if (key == 'B') // Backspace key
-    {
+        break;
+
+    case 'B': // Backspace
         navControl = KEY_BACKSPACE;
-        if (len > 0)
-            buffer[len - 1] = '\0'; // Remove last character
-    }
-    else if (key == 'C') // Cancel key
-    {
+        if (buffer && len > 0)
+            buffer[len - 1] = '\0';
+        break;
+
+    case 'C': // Cancel
         navControl = KEY_CANCEL;
-        buffer[0] = '\0';
-    }
-    else if (key == 'D') // Special key
-    {
+        if (buffer)
+            buffer[0] = '\0';
+        break;
+
+    case 'D': // Special
         navControl = KEY_SPECIAL;
-    }
-    else
-    {
-        if (len < bufferSize - 1)
+        break;
+
+    default:
+        navControl = NONE;  
+        if (buffer && len < bufferSize - 1)
         {
             buffer[len] = key;
             buffer[len + 1] = '\0';
         }
+        break;
     }
+
     return true;
 }
+
 
 void checkDiagnosticAccess()
 {
@@ -658,7 +668,11 @@ void fillCountingFields()
     hmi.display("JUMP(1)"); 
     hmi.display("SET_TXT", 1, -1, userCode); 
     hmi.display("SET_TXT", 5, -1, taskCode); 
-    hmi.display("SET_TXT", 7, -1, productName);
+    // hmi.display("SET_TXT", 7, -1, productName);
+    hmi.display("SET_TXT", 7, -1, productName, []() {
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+        currentState = COUNTING;
+    });
 }
 
 void confirmProductionOrder()
@@ -669,9 +683,9 @@ void confirmProductionOrder()
     {
         productCount = 0;
         countingStartTime = millis();
-        currentState = COUNTING;
+        // currentState = COUNTING;
         taskCodeConfirmed = false;
-        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+        // attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
         hmi.clearQueue();
         fillCountingFields();
     }
@@ -699,6 +713,8 @@ void handleCounting()
     {
         lastProductCount = productCount;
         String countStr = formatNumberWithCommas(productCount);
+        Serial.println("Product Count: " + countStr);
+        hmi.clearQueue();
         hmi.display("SET_TXT", 2, -1, countStr.c_str());
 
         unsigned long duration = millis() - countingStartTime;
@@ -708,6 +724,7 @@ void handleCounting()
             if (now - lastPPHUpdate >= 20000)
             {
                 long pph = (productCount * 3600) / (duration / 1000);
+                hmi.clearQueue();
                 hmi.display("SET_TXT", 4, -1, ("PPH: " + String(pph)).c_str());
                 lastPPHUpdate = now;
             }
@@ -743,9 +760,10 @@ void handleLogout()
     }
     else if (navControl == KEY_CANCEL)
     {
+        lastProductCount = 0;
         fillCountingFields();
-        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
-        currentState = COUNTING;
+        // attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onProductDetectedISR, FALLING);
+        // currentState = COUNTING;
     }
 
     if (loggedOut)
